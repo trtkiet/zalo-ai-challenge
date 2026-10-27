@@ -5,6 +5,20 @@ The required upload format is **UTF-8 JSON Lines**, `submission.jsonl`, with one
 `{id, tool_calls, state_hash}` object per input sample, not a large JSON array.
 Fine-tuning manifest preparation is not needed for inference.
 
+The launcher automatically reads `.ENV` from `finetuning/` or the repository
+root. With `DATA_ROOT`, `RESULT`, `FINETUNE_HOME` and `HF_HOME` configured there,
+you can omit the corresponding shell exports and run:
+
+```bash
+bash finetune.sh submit --batch-size 4 --allow-download
+bash finetune.sh validate-submission
+```
+
+Output defaults to `RESULT`, and validation input to `RESULT/submission.jsonl`.
+For a preview or another model run, pass a new `--output` directory. CLI arguments
+override exported shell variables, which override `.ENV` defaults. See the
+[local settings guide](README.md#local-settings-in-env) for expansion and file selection.
+
 ## Environments and a small preview
 
 Use your existing ASR and LLM environments. If not installed:

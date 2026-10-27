@@ -13,6 +13,50 @@ the default is one sample. See the submission guide for timing and resume detail
 There is no automatic upload or model publication.
 Keep the competition data and derived manifests private as required by its README.
 
+## Local settings in `.ENV`
+
+The launcher and Python CLI automatically load `.ENV` from this folder, or from
+its parent (the repository root). If both exist, the file in `finetuning/` is
+used. The repository's file currently defines:
+
+```dotenv
+RESULT="$HOME/zalo-ai/zalo-ai-challenge/results"
+FINETUNE_HOME="$HOME/zalo-ai/zalo-ai-challenge/finetune"
+HF_HOME="$HOME/zalo-ai/zalo-ai-challenge/huggingface"
+DATA_ROOT="$HOME/zalo-ai/zalo-ai-challenge/data/train+public_test"
+```
+
+`DATA_ROOT` supplies `--data-root`; `RESULT` supplies `--output` for preparation,
+training/evaluation/export and submission commands. Submission validation defaults
+to `RESULT/submission.jsonl`. `FINETUNE_HOME` selects the isolated environments
+and ASR source cache, while `HF_HOME` selects the Hugging Face cache. You can run:
+
+```bash
+cd finetuning
+bash finetune.sh submit --batch-size 4 --allow-download
+bash finetune.sh validate-submission
+```
+
+Precedence is **explicit CLI argument > exported shell variable > `.ENV` value**.
+Output directories must still be new/empty, or explicitly resumed. For a preview,
+choose a separate directory without changing the file:
+
+```bash
+bash finetune.sh submit --batch-size 4 --limit 12 --allow-download \
+  --output "$HOME/zalo-ai/zalo-ai-challenge/results-preview"
+```
+
+The file supports comments, quoted values, optional `export`, and `$VAR`/`${VAR}`
+expansion from the environment or earlier lines. Single-quoted values are literal;
+shell commands are never executed. Set `LIFEMATE_ENV_FILE=/path/to/.ENV` to choose
+a different file. For a specific bootstrap/runtime interpreter, export `PYTHON`
+or put its executable path in `.ENV`.
+
+Automatic loading applies inside the launched process; it does not export variables
+back into your terminal. Omit flags to use the defaults, or use explicit paths
+when passing arguments. Portable archives exclude your actual `.ENV`; copy it
+separately to the repository root or `finetuning/` on the target machine.
+
 ## Quick start
 
 Run from the copied `finetuning/` directory. `DATA_ROOT` is the folder containing

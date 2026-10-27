@@ -4,6 +4,11 @@ Checked locally on Windows, Python 3.12, without PyTorch/CUDA training libraries
 
 ## Passed
 
+- `.ENV` loading: 45 CPU tests total. Added checks for repository/toolkit file
+  selection, explicit file overrides, quoted paths and variable expansion,
+  exported-variable and CLI precedence, literal command text, atomic failure on
+  invalid settings, CLI path defaults and required arguments without defaults.
+
 - Independent-sample batching: 39 CPU tests total, including shrinking model
   batches, separate live tool histories, result ordering, repair/error isolation,
   deadline enforcement before actions, batch timeout/interruption preservation,

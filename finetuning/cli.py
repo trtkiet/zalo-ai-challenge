@@ -8,21 +8,25 @@ import subprocess
 import sys
 
 from ftkit.common import resolve_config
+from ftkit.env import load_env_file
 
 
 def parser():
+    load_env_file()
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("help")
     prep = sub.add_parser("prepare", help="Build isolated train/validation manifests without reading app states")
-    prep.add_argument("--data-root", required=True)
-    prep.add_argument("--output", required=True)
+    prep.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")))
+    prep.add_argument("--output", default=os.environ.get("RESULT"), required=not bool(os.environ.get("RESULT")))
     prep.add_argument("--seed", type=int, default=42)
     prep.add_argument("--validation-fraction", type=float, default=0.1)
     submit = sub.add_parser("submit", help="Run audio -> agent -> ToolEnv and create a submission JSONL")
-    submit.add_argument("--data-root", required=True, help="Directory containing public_test/ (or private_test/)")
+    submit.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")),
+                        help="Directory containing public_test/ (or private_test/); default: DATA_ROOT")
     submit.add_argument("--split", choices=["public_test", "private_test"], default="public_test")
-    submit.add_argument("--output", required=True, help="New run directory; contains submission.jsonl")
+    submit.add_argument("--output", default=os.environ.get("RESULT"), required=not bool(os.environ.get("RESULT")),
+                        help="New run directory; contains submission.jsonl; default: RESULT")
     for kind in ("asr", "llm"):
         submit.add_argument(f"--{kind}-config", help=f"Model configuration for {kind}")
         submit.add_argument(f"--{kind}-model", help="Compatible HF model ID or local model directory")
@@ -43,9 +47,10 @@ def parser():
     submit.add_argument("--resume", action="store_true", help="Continue finalized samples from this exact run")
     submit.add_argument("--allow-download", action="store_true", help="Allow startup model download; default is cached/local offline loading")
     check = sub.add_parser("validate-submission", help="Validate coverage, schemas and hash format without replaying tools")
-    check.add_argument("--data-root", required=True)
+    check.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")))
     check.add_argument("--split", choices=["public_test", "private_test"], default="public_test")
-    check.add_argument("--input", required=True, help="Submission JSONL file")
+    check.add_argument("--input", default=str(Path(os.environ["RESULT"]) / "submission.jsonl") if os.environ.get("RESULT") else None,
+                       required=not bool(os.environ.get("RESULT")), help="Submission JSONL file; default: RESULT/submission.jsonl")
     for command in ("train-asr", "eval-asr", "export-asr", "transcribe", "train-llm", "eval-llm", "export-llm", "predict"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--config", help="Model YAML/JSON config; defaults to the initial model for this task")
@@ -55,8 +60,8 @@ def parser():
         cmd.add_argument("--profile", default="gpu24", help="gpu16, gpu24, large, dual16, or a profile file")
         cmd.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="Repeatable dotted config override, e.g. training.epochs=2")
         cmd.add_argument("--prepared", help="Prepared manifest directory")
-        cmd.add_argument("--output", help="New output directory, or the same run directory when resuming")
-        cmd.add_argument("--data-root", help="Override relocated audio root (folder containing train/)")
+        cmd.add_argument("--output", default=os.environ.get("RESULT"), help="New output directory, or the same run directory when resuming; default: RESULT")
+        cmd.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), help="Override relocated audio root (folder containing train/); default: DATA_ROOT")
         cmd.add_argument("--resume", help="Training checkpoint; restores training and RNG state")
         cmd.add_argument("--checkpoint", help="Checkpoint/adapter for evaluation, inference or export; omit for pretrained evaluation")
         cmd.add_argument("--smoke-test", action="store_true", help="Short training run plus checkpoint resume and export/reload checks")

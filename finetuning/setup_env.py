@@ -10,6 +10,8 @@ import subprocess
 import sys
 import venv
 
+from ftkit.env import load_env_file
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -22,6 +24,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("environment", choices=["asr", "llm"])
     args = parser.parse_args()
+    try:
+        load_env_file()
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
         parser.error("Training setup requires Linux x86_64 with NVIDIA CUDA. On Windows use WSL2 or copy the folder to a GPU server.")
     if not (3, 10) <= sys.version_info[:2] <= (3, 12):

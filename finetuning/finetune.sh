@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The bootstrap interpreter only parses configuration, so system Python 3.14
+# can still load a .ENV that selects Python 3.10-3.12 via PYTHON.
+if ! ENV_EXPORTS="$("${PYTHON:-python3}" "$ROOT/ftkit/env.py" --shell)"; then
+  exit 2
+fi
+eval "$ENV_EXPORTS"
+unset ENV_EXPORTS
 export FINETUNE_HOME="${FINETUNE_HOME:-$ROOT}"
 export HF_HOME="${HF_HOME:-$FINETUNE_HOME/.cache/huggingface}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
