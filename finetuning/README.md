@@ -7,7 +7,8 @@ pinned Gipformer/k2 wheels. Setup checks this before installing anything. It doe
 not change your notebook's global Python packages or install a driver.
 
 The initial models are Gipformer 1.5 (Zipformer RNN-T) and Qwen SEA-LION v4 4B VL.
-There is no automatic upload, model publication, or full agent/submission runner.
+An offline public/private-test submission runner is included; see [SUBMISSION.md](SUBMISSION.md).
+There is no automatic upload or model publication.
 Keep the competition data and derived manifests private as required by its README.
 
 ## Quick start
@@ -161,6 +162,10 @@ an accuracy comparison. You can attempt 8K with `--set training.max_seq_length=8
 on a 16 GB GPU, but memory fit must be established by a smoke test.
 
 ## Evaluation and resume
+
+For **audio → live tool execution → submission.jsonl**, use the separate
+[`submit` command](SUBMISSION.md). The `eval-llm` command below remains a
+teacher-forced model check and is not the submission pipeline.
 
 ```bash
 bash finetune.sh eval-asr --prepared "$PREPARED" --output /work/asr-eval \

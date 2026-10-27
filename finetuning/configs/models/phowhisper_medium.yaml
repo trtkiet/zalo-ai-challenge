@@ -1,0 +1,8 @@
+{
+  "backend": "hf_whisper",
+  "model": "vinai/PhoWhisper-medium",
+  "revision": "main",
+  "tokenizer": {"model": null, "revision": null},
+  "architecture": {"handler": "whisper", "language": "vi", "chunk_seconds": 30},
+  "training": {"seed": 42}
+}

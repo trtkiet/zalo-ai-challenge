@@ -12,12 +12,21 @@ Checked locally on Windows, Python 3.12, without PyTorch/CUDA training libraries
   configuration, changed-dataset resume rejection, ASR shape guards, duration
   batching and corpus error-rate calculation.
 - Bash syntax check and Python source compilation/AST parsing.
+- 12 additional submission tests (28 tests total): live-result feedback, history
+  transcription, exact executed-call logs, clarification, invalid-response repair,
+  installed-tool restrictions, limits, interruption/timeout preservation, coverage,
+  resume without recreating sessions, preview naming/coverage, real worker IPC
+  and process timeout/termination.
+  Neural models and app states are synthetic test doubles for these CPU tests.
 - Preparation against the real labeled train set: 1,391 training conversations /
   4,526 clips / 6.13975 hours; 154 validation conversations / 510 clips / 0.68950 hours.
 - Actual Qwen SEA-LION tokenizer at revision `d0734aa`: all 1,545 trajectories
   passed prefix-stability and current-assistant loss-mask construction. Every
   reference tool call passed the model-level schema checker.
 - Pinned lhotse, kaldialign, PEFT, Accelerate and bitsandbytes versions exist on PyPI.
+- The three organizer-supplied example submission rows pass the new runner's
+  structural/schema checks using the actual public-test catalog/runtime. No app
+  environment was instantiated or replayed for that validation.
 
 ## Real tokenizer lengths
 
@@ -36,6 +45,8 @@ additional space for the output budget and report their own exclusion counts.
 - QLoRA updates, actual VRAM usage, mixed-precision stability and throughput.
 - One-/two-GPU training, optimizer/RNG resume and export/reload on CUDA.
 - Improvements in ASR WER, tool calling or competition score.
+- Public/private-test neural inference, Whisper inference, combined GPU memory,
+  and the 30-second end-to-end agent latency on competition hardware.
 
 Run both supplied `--smoke-test` commands on the target host before full training.
 They are implemented checks, not claims that those checks already passed locally.

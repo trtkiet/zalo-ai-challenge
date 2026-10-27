@@ -36,7 +36,7 @@ def merge(base, override):
     return result
 
 
-def resolve_config(args, kind):
+def resolve_config(args, kind, allowed_backends=None):
     path = Path(args.config) if args.config else ROOT / "configs" / "models" / ("gipformer.yaml" if kind == "asr" else "qwen_sealion.yaml")
     config = read_config(path)
     # Exports carry their training architecture/base-model identity. Reuse it by
@@ -71,7 +71,7 @@ def resolve_config(args, kind):
             target = target.setdefault(part, {})
         target[parts[-1]] = value
     expected = "zipformer_rnnt" if kind == "asr" else "hf_sft"
-    if config.get("backend") != expected:
+    if config.get("backend") not in (allowed_backends or (expected,)):
         raise ValueError(f"This command needs backend {expected}; got {config.get('backend')}. Add a backend for another architecture.")
     config["config_path"] = str(path.resolve())
     return config
