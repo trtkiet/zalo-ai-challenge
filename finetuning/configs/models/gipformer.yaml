@@ -17,7 +17,7 @@
     "pos_dim": 48, "decoder_dim": 512, "joiner_dim": 512,
     "context_size": 2, "causal": false, "chunk_size": "-1",
     "left_context_frames": "-1", "use_transducer": true,
-    "use_ctc": false, "use_attention_decoder": false
+    "use_ctc": true, "use_attention_decoder": false
   },
   "training": {
     "seed": 42, "epochs": 10, "learning_rate": 0.0001,

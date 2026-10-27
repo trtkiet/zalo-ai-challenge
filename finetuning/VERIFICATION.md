@@ -4,6 +4,16 @@ Checked locally on Windows, Python 3.12, without PyTorch/CUDA training libraries
 
 ## Passed
 
+- Independent-sample batching: 39 CPU tests total, including shrinking model
+  batches, separate live tool histories, result ordering, repair/error isolation,
+  deadline enforcement before actions, batch timeout/interruption preservation,
+  left-padding/attention masks/output slicing, context-overflow isolation,
+  Gipformer clip ordering with malformed-input isolation, Whisper chunk/audio
+  ordering and attention masks, grouped submission
+  generation/resume, changed-batch-size rejection, and batch worker IPC.
+  These checks use synthetic environments and neural test doubles. Actual
+  batched CUDA execution, throughput, VRAM fit and repeatability are unverified.
+
 - 16 dependency-free unit tests: conversation/utterance split isolation,
   deterministic splits, output collision protection, safe audio paths, preparation
   without environment directories, chronological tool results, current-assistant

@@ -29,6 +29,54 @@ Limited runs write `preview.jsonl`, never `submission.jsonl`. Review
 `summary.json`, `traces.jsonl` and worker logs. Preview and full runs must use
 separate output directories.
 
+## Batch independent samples on one GPU
+
+`--batch-size` controls how many independent samples share neural inference.
+The default is `1`, preserving individual requests. Start with `4` on a GPU
+with available memory, then compare throughput, timeout counts and peak VRAM:
+
+```bash
+bash finetune.sh submit --data-root "$DATA_ROOT" \
+  --batch-size 4 --limit 12 --allow-download \
+  --output "$HOME/lifemate/batch4-preview"
+
+# Full submission: omit --limit and use a new directory.
+bash finetune.sh submit --data-root "$DATA_ROOT" \
+  --batch-size 4 --allow-download \
+  --output "$HOME/lifemate/batch4-public"
+```
+
+Model/config/checkpoint options work as above. Existing environments can be
+reused after copying the updated toolkit; no new dependencies are required.
+
+The runner creates exactly one `ToolEnv` per sample, batches ASR clips and the
+next LLM action across samples, and executes each action only in its own
+environment. LLM prompts are left padded with attention masks; context overflow
+fails that sample without truncating its prompt. Gipformer audio clips and
+Whisper/PhoWhisper chunks are batched, retaining history/current-audio order.
+Only one copy of each model is loaded; batching does not launch model replicas.
+
+Batches are fixed groups: completed samples leave the active group, and the
+next group starts when the current group finishes. Each sample's 30-second
+deadline includes environment creation, ASR, waiting in its active group, LLM
+generation and tool execution. The earliest deadline bounds a shared worker
+request. Increasing batch size can improve throughput while increasing latency
+and KV-cache memory. OOMs are reported rather than silently retried with another
+batch size. Batch size `4` is a starting experiment, not a memory-fit guarantee.
+
+`summary.json` includes `batch_size`, `processed_this_run`, `inference_seconds`
+and `samples_per_second`. Inference timing excludes initial model loading and
+the up-front input fingerprinting. Compare the same sample limit/settings and
+inspect timeout/error counts alongside throughput. Traces also include ASR and
+per-action generation timings, including batch waiting time.
+
+Batch size is part of resume identity: repeat the same size with `--resume`.
+A clean Ctrl-C during inference finalizes the active group's actual calls and
+hashes before stopping. A hard crash retains an unfinished-group marker and
+resume refuses to recreate those sessions. Batched GPU execution and numerical
+repeatability still need verification on the target host; batching can change
+floating-point results even with greedy decoding.
+
 ## Choose models and run the full public test
 
 ### Fine-tuned Gipformer + SEA-LION adapter

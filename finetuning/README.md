@@ -8,6 +8,8 @@ not change your notebook's global Python packages or install a driver.
 
 The initial models are Gipformer 1.5 (Zipformer RNN-T) and Qwen SEA-LION v4 4B VL.
 An offline public/private-test submission runner is included; see [SUBMISSION.md](SUBMISSION.md).
+Its optional `submit --batch-size 4` batches independent samples on one GPU;
+the default is one sample. See the submission guide for timing and resume details.
 There is no automatic upload or model publication.
 Keep the competition data and derived manifests private as required by its README.
 

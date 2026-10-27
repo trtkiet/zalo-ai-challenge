@@ -85,7 +85,19 @@ def main():
             with redirect_stdout(sys.stderr), torch.inference_mode():
                 seconds = max(0.001, float(request["seconds"]))
                 started = time.monotonic()
-                if args.kind == "llm":
+                if request.get("operation", "").endswith("_batch"):
+                    from .batched_inference import generate_batch, transcribe_batch
+                    requests = request["requests"]
+                    if not isinstance(requests, list) or not requests:
+                        raise ValueError("A model batch requires a nonempty request list")
+                    if args.kind == "llm":
+                        results = generate_batch(model, tokenizer, config, requests, seconds)
+                    else:
+                        results = transcribe_batch(model, config, requests, seconds,
+                                                   loaded=loaded if backend == "zipformer_rnnt" else None,
+                                                   processor=processor if backend == "hf_whisper" else None)
+                    value = {"results": results}
+                elif args.kind == "llm":
                     ids = tokenizer.apply_chat_template(request["messages"], tokenize=True, add_generation_prompt=True)
                     maximum = min(16384, int(config["training"]["max_seq_length"]))
                     budget = int(config["training"].get("generation_max_new_tokens", 512))

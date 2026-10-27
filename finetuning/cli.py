@@ -31,6 +31,8 @@ def parser():
         submit.add_argument(f"--{kind}-python", help="Override worker Python; defaults to its isolated environment")
         submit.add_argument(f"--{kind}-set", action="append", default=[], metavar="KEY=VALUE")
     submit.add_argument("--profile", default="gpu24")
+    submit.add_argument("--batch-size", type=int, default=1,
+                        help="Independent samples per inference batch (default: 1); each keeps its own 30s deadline")
     submit.add_argument("--icefall-dir")
     submit.add_argument("--max-seconds", type=float, default=30.0, help="Hard per-sample wall-clock deadline, including all audio/history")
     submit.add_argument("--max-tool-calls", type=int, default=12)

@@ -187,6 +187,14 @@ class Worker:
             raise RuntimeError(response.get("error", "Model request failed"))
         return response
 
+    def request_batch(self, operation, payloads, deadline):
+        response = self.request(operation + "_batch", {"requests": payloads}, deadline)
+        results = response.get("results")
+        if (not isinstance(results, list) or len(results) != len(payloads)
+                or any(not isinstance(result, dict) or type(result.get("ok")) is not bool for result in results)):
+            raise RuntimeError("Worker returned mismatched batch results")
+        return results
+
     def close(self):
         if self.process is not None:
             process, self.process = self.process, None
@@ -204,7 +212,8 @@ class Worker:
             self.log = None
 
 
-def infer_sample(item, tools, env, asr, llm, root, split, *, max_seconds=30, max_tool_calls=12, max_turns=20, max_repairs=2, started=None):
+def sample_steps(item, tools, env, root, split, *, max_seconds=30, max_tool_calls=12, max_turns=20, max_repairs=2, started=None):
+    """Yield model requests, preserving one environment and one deadline per sample."""
     started = time.monotonic() if started is None else started
     deadline = started + max_seconds
     trace = {"id": item["id"], "status": "error", "steps": []}
@@ -218,7 +227,9 @@ def infer_sample(item, tools, env, asr, llm, root, split, *, max_seconds=30, max
         user_turns = [h for h in history if h["role"] == "user"]
         paths = [str(audio_path(root, split, h["audio"])) for h in user_turns]
         paths.append(str(audio_path(root, split, item["audio"])))
-        texts = asr.request("transcribe", {"audio": paths}, deadline)["texts"]
+        asr_started = time.monotonic()
+        texts = (yield ("asr", "transcribe", {"audio": paths}, deadline))["texts"]
+        trace["asr_seconds"] = time.monotonic() - asr_started
         if len(texts) != len(paths) or not all(isinstance(t, str) and t.strip() for t in texts):
             raise ValueError("ASR returned empty or mismatched transcripts")
         for turn, text in zip(user_turns, texts):
@@ -232,9 +243,12 @@ def infer_sample(item, tools, env, asr, llm, root, split, *, max_seconds=30, max
         repairs = 0
         for _ in range(max_turns):
             remaining()
-            response = llm.request("generate", {"messages": messages}, deadline)
+            generation_started = time.monotonic()
+            response = yield ("llm", "generate", {"messages": messages}, deadline)
+            remaining()  # Never execute a response returned after this sample's deadline.
             text = response["text"]
-            entry = {"response": text, "input_tokens": response.get("input_tokens")}
+            entry = {"response": text, "input_tokens": response.get("input_tokens"),
+                     "generation_seconds": time.monotonic() - generation_started}
             trace["steps"].append(entry)
             try:
                 calls = parse_response(text)
@@ -279,6 +293,86 @@ def infer_sample(item, tools, env, asr, llm, root, split, *, max_seconds=30, max
     result = {"id": item["id"], "tool_calls": env.get_tool_calls(), "state_hash": env.get_state_hash()}
     trace["elapsed_seconds"] = time.monotonic() - started
     return result, trace
+
+
+def infer_sample(item, tools, env, asr, llm, root, split, **settings):
+    """Drive the same sample state machine using individual model requests."""
+    steps = sample_steps(item, tools, env, root, split, **settings)
+    workers = {"asr": asr, "llm": llm}
+    response, error = None, None
+    while True:
+        try:
+            request = steps.throw(error) if error is not None else steps.send(response)
+        except StopIteration as done:
+            return done.value
+        kind, operation, payload, deadline = request
+        try:
+            response = workers[kind].request(operation, payload, deadline)
+            error = None
+        except (Exception, KeyboardInterrupt) as exc:
+            error = exc
+
+
+def infer_batch(items, tools, package, workers, root, split, **settings):
+    """Batch independent model requests; tools always run within their own sample.
+
+    Fixed groups deliberately keep ordering/resume deterministic. Completed samples
+    leave the active batch; a fresh group starts after the current group finishes.
+    """
+    generators, pending, completed = {}, {}, {}
+
+    def advance(index, response=None, error=None):
+        try:
+            pending[index] = generators[index].throw(error) if error is not None else generators[index].send(response)
+        except StopIteration as done:
+            completed[index] = done.value
+            pending.pop(index, None)
+
+    def interrupt():
+        for index in list(pending):
+            advance(index, error=KeyboardInterrupt())
+
+    for index, item in enumerate(items):
+        started = time.monotonic()
+        env = package.ToolEnv(split, item["id"], root=root)
+        generators[index] = sample_steps(item, tools, env, root, split, started=started, **settings)
+        advance(index)
+    try:
+        while pending:
+            for index, request in list(pending.items()):
+                if time.monotonic() >= request[3]:
+                    advance(index, error=TimeoutError("Sample deadline exceeded"))
+            for kind in ("asr", "llm"):
+                indices = [i for i, request in pending.items() if request[0] == kind]
+                if not indices:
+                    continue
+                requests = [pending[i] for i in indices]
+                # Earliest deadline bounds the shared worker; queuing is timed.
+                deadline = min(request[3] for request in requests)
+                try:
+                    responses = workers[kind].request_batch(requests[0][1], [r[2] for r in requests], deadline)
+                    if len(responses) != len(indices):
+                        raise RuntimeError("Worker returned mismatched batch results")
+                except KeyboardInterrupt:
+                    interrupt()
+                    return [completed[i] for i in range(len(items))]
+                except Exception as exc:
+                    for index in indices:
+                        advance(index, error=exc)
+                    continue
+                for index, response in zip(indices, responses):
+                    if time.monotonic() >= pending[index][3] or response.get("error_type") == "TimeoutError":
+                        advance(index, error=TimeoutError(response.get("error", "Sample deadline exceeded")))
+                    elif response.get("ok"):
+                        advance(index, response=response)
+                    else:
+                        advance(index, error=RuntimeError(response.get("error", "Model request failed")))
+                    if index in completed and completed[index][1]["status"] == "interrupted":
+                        interrupt()
+                        return [completed[i] for i in range(len(items))]
+    except KeyboardInterrupt:
+        interrupt()
+    return [completed[i] for i in range(len(items))]
 
 
 def validate_records(rows, items, catalog, package):
@@ -333,6 +427,8 @@ def run(args):
         raise ValueError("--max-seconds must be > 0 and <= the competition's 30-second budget")
     if args.limit < 0 or args.max_tool_calls < 1 or args.max_turns < 1 or args.max_repairs < 0:
         raise ValueError("Invalid sample/call/turn/repair limits")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
     root = Path(args.data_root).expanduser().resolve()
     items, catalog, tools = inputs(root, args.split)
     if args.limit:
@@ -361,9 +457,11 @@ def run(args):
     # Fingerprint only documented inputs/catalog and supplied runtime code, never app states.
     runtime_files = {str(p.relative_to(root / args.split)): p.read_text(encoding="utf-8")
                      for p in sorted((root / args.split / "zaic_tools").rglob("*.py"))}
+    batching = {"batch_size": args.batch_size, "scheduler": "fixed_groups_v1"} if args.batch_size > 1 else {}
     identity = digest({"items": items, "audio_sha256": audio_hashes, "catalog": catalog, "runtime": runtime_files,
                        "configs": identity_configs, "artifacts": artifacts,
-                       "settings": [args.split, args.limit, args.max_seconds, args.max_tool_calls, args.max_turns, args.max_repairs]})
+                       "settings": [args.split, args.limit, args.max_seconds, args.max_tool_calls, args.max_turns, args.max_repairs],
+                       **batching})
     out = Path(args.output).expanduser().resolve()
     ledger = out / "results.jsonl"
     if args.resume:
@@ -378,7 +476,7 @@ def run(args):
         out = fresh_directory(out)
         results = []
         write_json(out / "submission_run.json", {"identity": identity, "split": args.split, "preview": bool(args.limit),
-                                                "configs": configs, "max_seconds": args.max_seconds})
+                                                "configs": configs, "max_seconds": args.max_seconds, "batch_size": args.batch_size})
     workers = {}
     try:
         for kind, config in configs.items():
@@ -395,25 +493,36 @@ def run(args):
         write_json(prior_models, metadata)
         if metadata["llm"]["parameters"] >= 5_000_000_000 or sum(m["parameters"] for m in metadata.values()) >= 6_000_000_000:
             raise ValueError("Selected checkpoints exceed the LLM <5B / whole-system <6B parameter limits")
+        inference_started, prior_count = time.monotonic(), len(results)
         with ledger.open("a", encoding="utf-8") as stream, (out / "traces.jsonl").open("a", encoding="utf-8") as traces:
-            for item in items[len(results):]:
-                # A marker guards against silently resetting a half-executed sample after a hard crash.
-                write_json(out / "inflight.json", {"id": item["id"]})
-                started = time.monotonic()
-                env = package.ToolEnv(args.split, item["id"], root=root)  # exactly once for this sample
-                result, trace = infer_sample(item, tools, env, workers["asr"], workers["llm"], root, args.split,
-                                             max_seconds=args.max_seconds, max_tool_calls=args.max_tool_calls,
-                                             max_turns=args.max_turns, max_repairs=args.max_repairs, started=started)
-                stream.write(compact(result) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-                traces.write(compact(trace) + "\n")
-                traces.flush()
-                results.append(result)
+            for offset in range(len(results), len(items), args.batch_size):
+                group = items[offset:offset + args.batch_size]
+                # Retain all group IDs until finalized rows are durable. A crash
+                # must never silently recreate any session in a partial group.
+                write_json(out / "inflight.json", {"ids": [item["id"] for item in group]})
+                settings = dict(max_seconds=args.max_seconds, max_tool_calls=args.max_tool_calls,
+                                max_turns=args.max_turns, max_repairs=args.max_repairs)
+                if args.batch_size == 1:
+                    item = group[0]
+                    started = time.monotonic()
+                    env = package.ToolEnv(args.split, item["id"], root=root)
+                    batch_results = [infer_sample(item, tools, env, workers["asr"], workers["llm"], root,
+                                                  args.split, started=started, **settings)]
+                else:
+                    batch_results = infer_batch(group, tools, package, workers, root, args.split, **settings)
+                for result, trace in batch_results:
+                    stream.write(compact(result) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    traces.write(compact(trace) + "\n")
+                    traces.flush()
+                    os.fsync(traces.fileno())
+                    results.append(result)
+                    print(f"{len(results)}/{len(items)} {result['id']}: {trace['status']}, {len(result['tool_calls'])} calls, {trace['elapsed_seconds']:.2f}s", flush=True)
                 (out / "inflight.json").unlink()
-                print(f"{len(results)}/{len(items)} {item['id']}: {trace['status']}, {len(result['tool_calls'])} calls, {trace['elapsed_seconds']:.2f}s", flush=True)
-                if trace["status"] == "interrupted":
+                if any(trace["status"] == "interrupted" for _, trace in batch_results):
                     raise KeyboardInterrupt
+        inference_seconds = time.monotonic() - inference_started
         report = validate_records(results, items, catalog, package)
         filename = "preview.jsonl" if args.limit else "submission.jsonl"
         destination = out / filename
@@ -430,7 +539,10 @@ def run(args):
         counts = {}
         for trace in statuses:
             counts[trace["status"]] = counts.get(trace["status"], 0) + 1
-        report.update({"complete_split": not bool(args.limit), "statuses": counts, "output": str(destination)})
+        report.update({"complete_split": not bool(args.limit), "statuses": counts, "output": str(destination),
+                       "batch_size": args.batch_size, "processed_this_run": len(results) - prior_count,
+                       "inference_seconds": inference_seconds,
+                       "samples_per_second": (len(results) - prior_count) / max(inference_seconds, 1e-9)})
         write_json(out / "summary.json", report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
     finally:
