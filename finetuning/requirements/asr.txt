@@ -1,0 +1,13 @@
+--find-links https://k2-fsa.github.io/k2/cuda.html
+--find-links https://csukuangfj.github.io/kaldifeat/cuda.html
+k2==1.24.4.dev20250807+cuda12.8.torch2.8.0
+kaldifeat==1.25.5.dev20250807+cuda12.8.torch2.8.0
+lhotse==1.31.1
+sentencepiece==0.2.1
+huggingface-hub==0.35.3
+soundfile==0.13.1
+numpy==2.2.6
+tensorboard==2.20.0
+kaldialign==0.11
+pypinyin==0.50.0
+PyYAML==6.0.3

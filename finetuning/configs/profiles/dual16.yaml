@@ -1,0 +1,1 @@
+{"devices": 2, "precision": "auto", "training": {"max_seq_length": 4096, "max_audio_seconds": 40}}
