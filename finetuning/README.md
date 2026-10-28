@@ -1,15 +1,15 @@
 # LifeMate portable fine-tuning
 
 Copy **this entire folder** to a Linux x86_64 NVIDIA GPU machine. It is independent
-of the original checkout. Python 3.10–3.12 is supported; use 3.11 when possible.
-Training requires a driver supporting **CUDA 12.8 or newer**, as required by the
-pinned Gipformer/k2 wheels. Setup checks this before installing anything. It does
+of the original checkout. Use Python 3.11 for the isolated LLM runtimes; ASR supports Python 3.10–3.12.
+ASR training requires a driver supporting **CUDA 12.8 or newer**, as required by the
+pinned Gipformer/k2 wheels. Each LLM runtime resolves its own CUDA dependencies. Setup does
 not change your notebook's global Python packages or install a driver.
 
 The initial models are Gipformer 1.5 (Zipformer RNN-T) and Qwen SEA-LION v4 4B VL.
 An offline public/private-test submission runner is included; see [SUBMISSION.md](SUBMISSION.md).
-Its optional `submit --batch-size 4` batches independent samples on one GPU;
-the default is one sample. See the submission guide for timing and resume details.
+Its `submit --batch-size 4` continuously schedules up to four independent samples on one GPU;
+the default active-sample limit is one. See the submission guide for timing and resume details.
 There is no automatic upload or model publication.
 Keep the competition data and derived manifests private as required by its README.
 
@@ -120,12 +120,14 @@ revision to `main`; use `--revision COMMIT` to pin the replacement. For a local
 directory, revision is ignored. Tokenizer/architecture changes are independent
 and must remain compatible with the new checkpoint.
 
+The LLM migration, installation changes, and server verification commands are in [MIGRATION.md](MIGRATION.md).
+
 Compatibility is explicit:
 
-- `hf_sft`: Hugging Face causal-LM architectures supported by the pinned
-  Transformers version, and the `qwen3_vl` handler. Language projection names
-  must match the backend's supported attention/MLP targets. Custom remote model
-  code is not executed. Qwen3.5 VL and other multimodal families are not promised.
+- `unsloth_sft`: Unsloth training for Qwen3-VL and supported text-only causal
+  architectures; inference uses native vLLM. Legacy `hf_sft` metadata is normalized.
+  Vision adapters and custom remote code are not supported. Validate each family
+  in both runtimes before using it for a full run.
 - `zipformer_rnnt`: compatible icefall Zipformer transducer checkpoints with
   `model.pt`, `bpe.model`, and `tokens.txt`. Configure exact architecture dimensions.
   Whisper, CTC-only ASR, a new vocabulary, and different encoder families need
@@ -151,8 +153,8 @@ or upstream source are included in this folder.
 Profiles are starting configurations, not guarantees of fitting every checkpoint.
 For OOM, lower `training.max_seq_length` or `training.max_audio_seconds` in a new
 run. LLM microbatch defaults to one; gradient accumulation maintains an effective
-batch of 16 across all GPUs. Two GPUs use explicit `torchrun` DDP with one model
-replica per GPU; their VRAM is not pooled. ASR sharding pads its batch list so all
+batch of 16 on one GPU. Multi-GPU LLM profiles are rejected. Two-GPU ASR training
+uses explicit `torchrun` DDP with one model replica per GPU; VRAM is not pooled. ASR sharding pads its batch list so all
 ranks perform the same number of updates. This can repeat a small number of batches.
 
 BF16 is selected if supported; otherwise FP16 with gradient scaling is used.
@@ -184,28 +186,26 @@ current assistant JSON responses are supervised; history, system, user, tool and
 padding tokens are masked. Free-text `final_state` labels are omitted entirely.
 
 The assistant contract is exactly `{"tool_calls":[{"name":"app.tool","arguments":{}}]}`,
-at most one call per turn. `{"tool_calls":[]}` terminates a trajectory, including
+allowing several independent calls per turn, executed sequentially. Result-dependent
+actions must wait for their actual tool results before another generation. `{"tool_calls":[]}` terminates a trajectory, including
 out-of-scope cases. Clarification is a normal `sys.ask_missing_info` tool call.
 This custom JSON contract uses the model's chat template, not its native function
 calling markup. Any later agent runner must use the same prompt and contract.
 
-Defaults: text-only 4-bit NF4 QLoRA, frozen vision encoder, language attention/MLP
+Defaults: Unsloth text-only BF16 LoRA where supported, frozen vision encoder, language attention/MLP
 LoRA rank 16, alpha 32, dropout .05, three epochs, learning rate 1e-4. Full-parameter
-LLM training and image training are not implemented. Unquantized **LoRA** is
-available with `--set training.quantize=false` if sufficient memory is available.
+LLM training and image training are not implemented. Memory-saving QLoRA is
+available with `--set training.quantize=true`. Inference precision is configured independently.
 
 Overlength examples are **excluded**, with IDs/token counts in `length_report.json`.
 There is no silent truncation. Review exclusions before comparing runs; 4K can
 exclude substantially more examples than 8K. Chat templates that rewrite earlier
 prefixes are rejected rather than produce incorrect loss masks.
 
-**Measured with the initial Qwen tokenizer on this dataset:** 4K excludes
-809/1,391 training conversations and 82/154 validation conversations. At 8K,
-only one training conversation is excluded and all validation conversations fit.
-Prefer an 8K run on a 24 GB GPU when possible. The 16 GB profile is primarily a
-memory-conservative starting point; inspect its exclusions before using it for
-an accuracy comparison. You can attempt 8K with `--set training.max_seq_length=8192`
-on a 16 GB GPU, but memory fit must be established by a smoke test.
+Inspect `length_report.json` for the current tokenizer and prompt. Historical
+4K/8K exclusion counts from the initial prompt do not certify the migrated prompt.
+Use the largest context that fits on the actual target GPU without losing required
+training examples. The 16 GB profile is a starting point, not a memory guarantee.
 
 ## Evaluation and resume
 
@@ -254,7 +254,7 @@ bash finetune.sh transcribe --model /work/asr-export --audio /data/example.wav
 bash finetune.sh export-llm --checkpoint /work/llm-run/adapter --output /work/llm-export
 bash finetune.sh predict --checkpoint /work/llm-export --input /work/request.json
 
-# Optional: merge adapters into the original unquantized base. Allow ample CPU RAM
+# Optional: merge adapters into BF16 base weights. Allow GPU memory for the merge
 # (32 GB+ advisable), disk space, and time. The base must be cached or downloadable.
 bash finetune.sh export-llm --checkpoint /work/llm-run/adapter --output /work/llm-merged --merge
 bash finetune.sh predict --model /work/llm-merged --input /work/request.json
@@ -272,7 +272,7 @@ architecture configuration. Their decoding requires the pinned icefall checkout.
 ## Kaggle / Colab cells
 
 Upload the folder and competition data privately or mount them. Replace these
-example paths with your actual input locations. Python 3.10–3.12 and a compatible
+example paths with your actual input locations. Python 3.11 for LLMs and a compatible
 GPU driver are still required; setup stops clearly on an incompatible runtime.
 
 ```python
@@ -290,7 +290,7 @@ os.environ["HF_HOME"] = "/kaggle/working/hf-cache"                # Colab: /cont
 !bash finetune.sh train-llm --profile gpu16 --prepared /kaggle/working/prepared --output /kaggle/working/llm-smoke --smoke-test
 ```
 
-Run ASR with its own `setup asr`, `train-asr` and smoke output. Use `dual16` only
+Run ASR with its own `setup asr`, `train-asr` and smoke output. Multi-GPU profiles are ASR-only; use `dual16` only
 when both T4s are visible and you intend DDP. For Colab use `/content` paths and
 your mounted data path. Save checkpoints before a session expires.
 

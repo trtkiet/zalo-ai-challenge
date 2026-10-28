@@ -1,0 +1,7 @@
+# Bootstrap constraints, NOT a GPU-validated lock. Do not reuse the ASR Torch pin.
+vllm>=0.11,<1
+transformers>=4.57.1,<6
+accelerate>=1.10.1,<2
+peft>=0.17.1,<1
+safetensors>=0.6.2,<1
+PyYAML>=6,<7

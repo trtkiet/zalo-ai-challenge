@@ -21,7 +21,8 @@ if [[ "$COMMAND" == setup ]]; then
 fi
 case "$COMMAND" in
   train-asr|eval-asr|export-asr|transcribe) ENVIRONMENT=asr ;;
-  train-llm|eval-llm|export-llm|predict) ENVIRONMENT=llm ;;
+  train-llm|export-llm) ENVIRONMENT=llm-train ;;
+  eval-llm|predict) ENVIRONMENT=llm-infer ;;
   *) ENVIRONMENT="" ;;
 esac
 PY="${PYTHON:-python3}"

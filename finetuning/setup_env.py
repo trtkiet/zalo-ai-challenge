@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import venv
+import hashlib
 
 from ftkit.env import load_env_file
 
@@ -20,9 +21,39 @@ def run(*args):
     subprocess.run(list(map(str, args)), check=True)
 
 
+def setup_llm_environment(environment, home):
+    """Let each framework resolve its own Torch/CUDA dependencies in a fresh venv."""
+    if sys.version_info[:2] != (3, 11):
+        raise ValueError("LLM setup requires Python 3.11; select it with PYTHON=/path/to/python3.11")
+    destination = home / ".venvs" / environment
+    requirement = ROOT / "requirements" / f"{environment}.txt"
+    lock = ROOT / "requirements" / f"{environment}.lock.txt"
+    source = lock if lock.is_file() else requirement
+    signature = hashlib.sha256(source.read_bytes()).hexdigest()
+    marker = destination / "setup.json"
+    if destination.exists():
+        if marker.is_file() and json.loads(marker.read_text())["requirements_sha256"] == signature:
+            print(f"Reusing {destination}; run GPU validation separately.")
+            return
+        raise ValueError(f"Refusing to overwrite incomplete/incompatible environment {destination}; use a new FINETUNE_HOME")
+    venv.EnvBuilder(with_pip=True).create(destination)
+    py = destination / "bin" / "python"
+    run(py, "-m", "pip", "install", "pip==25.2")
+    run(py, "-m", "pip", "install", "-r", source)
+    run(py, "-m", "pip", "check")
+    prefix = "import unsloth; import trl; " if environment == "llm-train" else "import vllm; "
+    run(py, "-c", prefix + "import torch; assert torch.cuda.is_available(); assert torch.cuda.is_bf16_supported(); "
+        "print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())")
+    freeze = subprocess.check_output([str(py), "-m", "pip", "freeze"], text=True)
+    (destination / "installed-packages.txt").write_text(freeze)
+    marker.write_text(json.dumps({"requirements_sha256": signature, "source": source.name,
+                                  "gpu_model_smoke_verified": False, "python": sys.version}, indent=2))
+    print(f"Ready: {py}. Resolved packages are recorded; full model/GPU verification is still required.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("environment", choices=["asr", "llm"])
+    parser.add_argument("environment", choices=["asr", "llm", "llm-train", "llm-infer"])
     args = parser.parse_args()
     try:
         load_env_file()
@@ -36,6 +67,14 @@ def main():
         info = subprocess.check_output(["nvidia-smi"], text=True)
     except (OSError, subprocess.CalledProcessError):
         parser.error("nvidia-smi failed. Enable a GPU runtime/install the NVIDIA driver first.")
+    if args.environment != "asr":
+        home = Path(os.environ.get("FINETUNE_HOME", ROOT)).expanduser().resolve()
+        try:
+            for environment in (["llm-train", "llm-infer"] if args.environment == "llm" else [args.environment]):
+                setup_llm_environment(environment, home)
+        except (ValueError, subprocess.CalledProcessError) as exc:
+            parser.error(str(exc))
+        return
     match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", info)
     if not match or tuple(map(int, match.groups())) < (12, 8):
         parser.error("The pinned stack needs driver support for CUDA 12.8+. Use a compatible server/runtime; setup will not replace your driver.")

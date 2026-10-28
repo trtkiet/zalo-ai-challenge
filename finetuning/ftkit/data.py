@@ -129,7 +129,9 @@ def prepare(data_root, output, validation_fraction=0.1, seed=42):
 
 
 SYSTEM = """Bạn là trợ lý thực hiện yêu cầu qua công cụ. Chỉ trả về JSON hợp lệ theo dạng
-{\"tool_calls\":[{\"name\":\"app.tool\",\"arguments\":{}}]}. Mỗi lượt chọn tối đa một lời gọi.
+{\"tool_calls\":[{\"name\":\"app.tool\",\"arguments\":{}}]}. Có thể chọn nhiều lời gọi độc lập.
+Các lời gọi được thực hiện tuần tự. Chỉ gộp khi mọi tham số và điều kiện thực hiện đã biết.
+Nếu cần ID, kết quả đọc hoặc điều kiện từ công cụ, dừng danh sách và chờ kết quả trước khi chọn hành động tiếp.
 Khi đã xong hoặc yêu cầu ngoài phạm vi, trả về {\"tool_calls\":[]}.
 Chỉ dùng công cụ được cung cấp. Lấy ID từ lịch sử/ngữ cảnh/kết quả công cụ; không tự bịa.
 Đọc dữ liệu cần thiết trước khi quyết định hành động. Nếu còn thiếu thông tin, dùng
@@ -197,8 +199,6 @@ def generation_cases(tokenizer, record, max_length, max_new_tokens):
 def validate_action(value, tools):
     """Check JSON envelope, availability and catalog schema without executing tools."""
     if not isinstance(value, dict) or set(value) != {"tool_calls"} or not isinstance(value["tool_calls"], list):
-        return False
-    if len(value["tool_calls"]) > 1:
         return False
     catalog = {t["name"]: t for t in tools}
     for call in value["tool_calls"]:

@@ -51,10 +51,12 @@ def resolve_config(args, kind, allowed_backends=None):
     config = merge(config, read_config(profile))
     if args.model:
         config["model"] = args.model
+        config.pop("resolved_model_revision", None)
         # A source-specific default revision must never follow a model override.
         config["revision"] = "main"
     if args.revision:
         config["revision"] = args.revision
+        config.pop("resolved_model_revision", None)
     if getattr(args, "tokenizer", None):
         config["tokenizer"]["model"] = args.tokenizer
     for entry in getattr(args, "set", []) or []:
@@ -70,10 +72,14 @@ def resolve_config(args, kind, allowed_backends=None):
         for part in parts[:-1]:
             target = target.setdefault(part, {})
         target[parts[-1]] = value
-    expected = "zipformer_rnnt" if kind == "asr" else "hf_sft"
+    if kind == "llm" and config.get("backend") == "hf_sft":
+        config["backend"] = "unsloth_sft"  # Legacy metadata, not a legacy execution path.
+    expected = "zipformer_rnnt" if kind == "asr" else "unsloth_sft"
     if config.get("backend") not in (allowed_backends or (expected,)):
         raise ValueError(f"This command needs backend {expected}; got {config.get('backend')}. Add a backend for another architecture.")
     config["config_path"] = str(path.resolve())
+    if kind == "llm" and (int(config.get("devices", 1)) != 1 or int(os.environ.get("WORLD_SIZE", "1")) != 1):
+        raise ValueError("Unsloth/vLLM LLM commands support one GPU; select gpu16/gpu24/large")
     return config
 
 
@@ -85,8 +91,17 @@ def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
     tmp.replace(path)
+    if os.name != "nt":
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def read_jsonl(path):
@@ -123,7 +138,9 @@ def model_snapshot(config, patterns=None):
     if source.is_dir():
         return source.resolve(), "local:" + str(source.resolve())
     from huggingface_hub import snapshot_download
-    directory = Path(snapshot_download(config["model"], revision=config.get("revision", "main"), allow_patterns=patterns))
+    resolved = config.get("resolved_model_revision")
+    revision = resolved if resolved and not resolved.startswith("local:") else config.get("revision", "main")
+    directory = Path(snapshot_download(config["model"], revision=revision, allow_patterns=patterns))
     return directory, directory.name
 
 
@@ -173,7 +190,7 @@ def gpu_precision(config):
 
 def runtime_manifest(config, prepared=None):
     versions = {}
-    for name in ("torch", "torchaudio", "transformers", "peft", "accelerate", "bitsandbytes", "k2", "kaldifeat", "lhotse", "numpy"):
+    for name in ("torch", "torchaudio", "transformers", "peft", "accelerate", "bitsandbytes", "k2", "kaldifeat", "lhotse", "numpy", "unsloth", "unsloth-zoo", "trl", "vllm"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

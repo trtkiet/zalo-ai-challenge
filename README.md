@@ -49,6 +49,12 @@ measure the final-state competition score.
 
 ## Quick start
 
+The launcher loads variables from [`.ENV`](.ENV) automatically. `DATA_ROOT`
+defaults the dataset argument, `RESULT` defaults the output directory, and
+`FINETUNE_HOME`/`HF_HOME` select the runtime and model cache. Existing shell
+exports and explicit CLI arguments override file values. See the
+[settings guide](finetuning/README.md#local-settings-in-env).
+
 Run training and model inference on **Linux x86_64 with an NVIDIA GPU**. The toolkit
 supports Python 3.10–3.12 and recommends 3.11. Gipformer setup requires a driver
 supporting CUDA 12.8 or newer. Initial setup and model downloads require internet;

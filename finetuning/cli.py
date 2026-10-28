@@ -11,21 +11,30 @@ from ftkit.common import resolve_config
 from ftkit.env import load_env_file
 
 
+def configured_path(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError(
+            "path is empty. Omit this flag to use .ENV defaults, or pass an explicit path; "
+            "shell variables expand before the launcher loads .ENV."
+        )
+    return value
+
+
 def parser():
     load_env_file()
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("help")
     prep = sub.add_parser("prepare", help="Build isolated train/validation manifests without reading app states")
-    prep.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")))
-    prep.add_argument("--output", default=os.environ.get("RESULT"), required=not bool(os.environ.get("RESULT")))
+    prep.add_argument("--data-root", type=configured_path, default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")))
+    prep.add_argument("--output", type=configured_path, default=os.environ.get("RESULT"), required=not bool(os.environ.get("RESULT")))
     prep.add_argument("--seed", type=int, default=42)
     prep.add_argument("--validation-fraction", type=float, default=0.1)
     submit = sub.add_parser("submit", help="Run audio -> agent -> ToolEnv and create a submission JSONL")
-    submit.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")),
+    submit.add_argument("--data-root", type=configured_path, default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")),
                         help="Directory containing public_test/ (or private_test/); default: DATA_ROOT")
     submit.add_argument("--split", choices=["public_test", "private_test"], default="public_test")
-    submit.add_argument("--output", default=os.environ.get("RESULT"), required=not bool(os.environ.get("RESULT")),
+    submit.add_argument("--output", type=configured_path, default=os.environ.get("RESULT"), required=not bool(os.environ.get("RESULT")),
                         help="New run directory; contains submission.jsonl; default: RESULT")
     for kind in ("asr", "llm"):
         submit.add_argument(f"--{kind}-config", help=f"Model configuration for {kind}")
@@ -36,7 +45,7 @@ def parser():
         submit.add_argument(f"--{kind}-set", action="append", default=[], metavar="KEY=VALUE")
     submit.add_argument("--profile", default="gpu24")
     submit.add_argument("--batch-size", type=int, default=1,
-                        help="Independent samples per inference batch (default: 1); each keeps its own 30s deadline")
+                        help="Maximum active samples in the continuous scheduler (default: 1); each keeps its own 30s deadline")
     submit.add_argument("--icefall-dir")
     submit.add_argument("--max-seconds", type=float, default=30.0, help="Hard per-sample wall-clock deadline, including all audio/history")
     submit.add_argument("--max-tool-calls", type=int, default=12)
@@ -47,7 +56,7 @@ def parser():
     submit.add_argument("--resume", action="store_true", help="Continue finalized samples from this exact run")
     submit.add_argument("--allow-download", action="store_true", help="Allow startup model download; default is cached/local offline loading")
     check = sub.add_parser("validate-submission", help="Validate coverage, schemas and hash format without replaying tools")
-    check.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")))
+    check.add_argument("--data-root", type=configured_path, default=os.environ.get("DATA_ROOT"), required=not bool(os.environ.get("DATA_ROOT")))
     check.add_argument("--split", choices=["public_test", "private_test"], default="public_test")
     check.add_argument("--input", default=str(Path(os.environ["RESULT"]) / "submission.jsonl") if os.environ.get("RESULT") else None,
                        required=not bool(os.environ.get("RESULT")), help="Submission JSONL file; default: RESULT/submission.jsonl")
@@ -56,12 +65,12 @@ def parser():
         cmd.add_argument("--config", help="Model YAML/JSON config; defaults to the initial model for this task")
         cmd.add_argument("--model", help="Compatible HF checkpoint ID or local directory; resets default revision to main")
         cmd.add_argument("--revision", help="HF revision; pin a commit for reproducibility")
-        cmd.add_argument("--tokenizer", help="Optional tokenizer ID/directory override for hf_sft")
+        cmd.add_argument("--tokenizer", help="Optional compatible tokenizer ID/directory for Unsloth/vLLM")
         cmd.add_argument("--profile", default="gpu24", help="gpu16, gpu24, large, dual16, or a profile file")
         cmd.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="Repeatable dotted config override, e.g. training.epochs=2")
         cmd.add_argument("--prepared", help="Prepared manifest directory")
-        cmd.add_argument("--output", default=os.environ.get("RESULT"), help="New output directory, or the same run directory when resuming; default: RESULT")
-        cmd.add_argument("--data-root", default=os.environ.get("DATA_ROOT"), help="Override relocated audio root (folder containing train/); default: DATA_ROOT")
+        cmd.add_argument("--output", type=configured_path, default=os.environ.get("RESULT"), help="New output directory, or the same run directory when resuming; default: RESULT")
+        cmd.add_argument("--data-root", type=configured_path, default=os.environ.get("DATA_ROOT"), help="Override relocated audio root (folder containing train/); default: DATA_ROOT")
         cmd.add_argument("--resume", help="Training checkpoint; restores training and RNG state")
         cmd.add_argument("--checkpoint", help="Checkpoint/adapter for evaluation, inference or export; omit for pretrained evaluation")
         cmd.add_argument("--smoke-test", action="store_true", help="Short training run plus checkpoint resume and export/reload checks")

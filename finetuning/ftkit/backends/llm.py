@@ -1,81 +1,76 @@
-"""HF causal/Qwen3-VL text-only SFT with current-assistant loss masking."""
+"""Unsloth causal/Qwen3-VL text-only LoRA with current-assistant loss masking."""
 from __future__ import annotations
 
 import json
 import math
 import os
 from pathlib import Path
-import re
 import time
 
 from ..common import (fresh_directory, gpu_precision, model_snapshot, read_jsonl,
                       seed_everything, write_json, write_jsonl)
-from ..data import encode_trajectory, generation_cases, trajectory, validate_action
+from ..data import encode_trajectory, trajectory
 from ..training import barrier, begin_run, distributed, validate_existing_output
 
 
 def load(config, checkpoint=None, *, train=False, merge_export=False):
+    # Unsloth must patch the stack before any Torch/Transformers initialization.
+    from unsloth import FastLanguageModel, FastVisionModel
     import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
-    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from ..llm_common import tokenizer_for
 
-    dtype = torch.float32 if merge_export else gpu_precision(config)
-    # Reject unsupported families after fetching only metadata, before any large weights.
+    if int(config.get("devices", 1)) != 1 or int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        raise ValueError("LLM training supports one GPU")
     directory, revision = model_snapshot(config, ["config.json"])
+    config["resolved_model_revision"] = revision
     model_config = AutoConfig.from_pretrained(directory, trust_remote_code=False)
     handler = config["architecture"].get("handler", "auto")
-    if model_config.model_type == "qwen3_vl" and handler in ("auto", "qwen3_vl"):
-        cls = Qwen3VLForConditionalGeneration
+    vision = model_config.model_type == "qwen3_vl"
+    if vision and handler in ("auto", "qwen3_vl"):
+        loader = FastVisionModel
     elif type(model_config) in AutoModelForCausalLM._model_mapping and handler in ("auto", "causal_lm"):
-        cls = AutoModelForCausalLM
+        loader = FastLanguageModel
     else:
-        raise ValueError(f"Unsupported architecture {model_config.model_type!r} with handler {handler!r}. Supported handlers: HF causal_lm and qwen3_vl.")
+        raise ValueError(f"Unsupported Unsloth architecture {model_config.model_type!r} / handler {handler!r}")
     directory, revision = model_snapshot(config)
-    tokenizer_source = config.get("tokenizer", {}).get("model") or str(directory)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source,
-                                             revision=config.get("tokenizer", {}).get("revision"), trust_remote_code=False)
-    if not tokenizer.chat_template:
-        template_path = directory / "chat_template.json"
-        if template_path.is_file():
-            template = json.loads(template_path.read_text(encoding="utf-8"))
-            tokenizer.chat_template = template["chat_template"] if isinstance(template, dict) else template
-    if not tokenizer.chat_template:
-        raise ValueError("Model needs a chat template; configure a compatible tokenizer.")
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is None:
-            raise ValueError("Tokenizer needs an existing pad or EOS token")
-        tokenizer.pad_token = tokenizer.eos_token
+    settings = config["training"]
+    dtype = gpu_precision(config)
+    model, _ = loader.from_pretrained(model_name=str(directory), max_seq_length=settings["max_seq_length"],
+                                      dtype=dtype, load_in_4bit=settings.get("quantize", False) and not merge_export,
+                                      trust_remote_code=False, device_map={"": 0})
+    source = Path(checkpoint) if checkpoint and (Path(checkpoint) / "tokenizer_config.json").is_file() else directory
+    tokenizer = tokenizer_for(source, config)
     tokenizer.padding_side = "right"
-    kwargs = {"torch_dtype": dtype, "trust_remote_code": False, "attn_implementation": "sdpa"}
-    quantize = config["training"].get("quantize", True) and not merge_export
-    kwargs["device_map"] = "cpu" if merge_export else {"": int(os.environ.get("LOCAL_RANK", "0"))}
-    if quantize:
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                                         bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=dtype)
-    model = cls.from_pretrained(directory, **kwargs)
-    model.config.use_cache = not train
-    if train and quantize:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=config["training"]["gradient_checkpointing"])
     if checkpoint:
+        from peft import PeftModel
         model = PeftModel.from_pretrained(model, checkpoint, is_trainable=train)
     elif train:
         projections = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
-        names = [name for name, _ in model.named_modules() if name.endswith(projections) and ".visual." not in name and not name.startswith("visual.")]
-        if model_config.model_type == "qwen3_vl":
-            names = [name for name in names if ".language_model." in name]
+        names = [name for name, _ in model.named_modules() if name.endswith(projections)
+                 and ".visual." not in name and not name.startswith("visual.")]
+        if vision:
+            names = [name for name in names if ".language_model." in name or name.startswith("language_model.")]
         if not names:
-            raise ValueError("No supported language attention/MLP projections; add an architecture adapter.")
-        settings = config["training"]
-        lora = LoraConfig(r=settings["lora_rank"], lora_alpha=settings["lora_alpha"],
-                          lora_dropout=settings["lora_dropout"], target_modules="(?:" + "|".join(re.escape(n) for n in names) + ")",
-                          bias="none", task_type="CAUSAL_LM")
-        model = get_peft_model(model, lora)
+            raise ValueError("No supported language attention/MLP projections")
+        kwargs = dict(r=settings["lora_rank"], lora_alpha=settings["lora_alpha"],
+                      lora_dropout=settings["lora_dropout"], target_modules=names, bias="none",
+                      use_gradient_checkpointing=settings["gradient_checkpointing"], random_state=settings["seed"])
+        if vision:
+            kwargs.update(finetune_vision_layers=False, finetune_language_layers=True,
+                          finetune_attention_modules=True, finetune_mlp_modules=True)
+        model = loader.get_peft_model(model, **kwargs)
     if train:
-        if any(p.requires_grad for name, p in model.named_parameters() if ".visual." in name):
-            raise ValueError("Vision parameters unexpectedly trainable")
-        if config["training"]["gradient_checkpointing"]:
-            model.enable_input_require_grads()
-        model.print_trainable_parameters()
+        loader.for_training(model, use_gradient_checkpointing=settings["gradient_checkpointing"])
+        # VLM wrappers and their nested language models can own different configs.
+        # Disable all caches, including when activation checkpointing is turned off.
+        for module in model.modules():
+            nested_config = getattr(module, "config", None)
+            if nested_config is not None and hasattr(nested_config, "use_cache"):
+                nested_config.use_cache = False
+    model.config.use_cache = not train
+    if train and any(p.requires_grad for name, p in model.named_parameters() if "visual." in name):
+        raise ValueError("Vision parameters unexpectedly trainable")
     config["resolved_model_revision"] = revision
     return model, tokenizer
 
@@ -109,8 +104,12 @@ class Collator:
 
 
 def train(args, config):
+    import unsloth  # Must precede Torch, distributed() and Transformers.
     import torch
-    from transformers import Trainer, TrainerCallback, TrainingArguments
+    from transformers import TrainerCallback
+    from trl import SFTConfig, SFTTrainer
+    from datasets import Dataset
+    from ..llm_common import llm_identity
     from ..common import digest
     rank, world, local_rank = distributed(config, True)
     validate_existing_output(args, config)
@@ -125,7 +124,7 @@ def train(args, config):
     val_rows, val_excluded = prepare(tokenizer, val_records, settings["max_seq_length"])
     identity = digest({"dataset": metadata["fingerprint"], "model": config["model"], "revision": config["resolved_model_revision"],
                        "training": settings, "architecture": config["architecture"], "devices": world,
-                       "run_mode": "smoke" if args.smoke_test else "benchmark" if args.benchmark else "full"})
+                       "runtime": llm_identity(tokenizer), "run_mode": "smoke" if args.smoke_test else "benchmark" if args.benchmark else "full"})
     if args.resume:
         resume_meta = Path(args.resume) / "finetune_identity.json"
         if not resume_meta.is_file() or json.loads(resume_meta.read_text())["identity"] != identity:
@@ -162,7 +161,8 @@ def train(args, config):
 
     timing = TimingCallback()
     dtype = gpu_precision(config)
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
+        dataset_kwargs={"skip_prepare_dataset": True}, packing=False, max_length=settings["max_seq_length"],
         output_dir=str(out), num_train_epochs=settings["epochs"], max_steps=max_steps,
         per_device_train_batch_size=settings["microbatch_size"], per_device_eval_batch_size=1,
         gradient_accumulation_steps=accumulation, learning_rate=settings["learning_rate"],
@@ -176,9 +176,17 @@ def train(args, config):
         save_total_limit=2, logging_steps=1 if max_steps > 0 else 5,
         report_to=[], seed=settings["seed"], data_seed=settings["seed"],
         ddp_find_unused_parameters=False, remove_unused_columns=False,
-        dataloader_num_workers=0, optim="adamw_torch", save_safetensors=True,
+        dataloader_num_workers=0, optim="adamw_torch_fused", save_safetensors=True,
     )
-    trainer = Trainer(model=model, args=training_args, train_dataset=train_rows, eval_dataset=val_rows,
+    class MaskedTrainer(SFTTrainer):
+        def _get_train_sampler(self, train_dataset=None):
+            from transformers.trainer_pt_utils import LengthGroupedSampler
+            rows = self.train_dataset if train_dataset is None else train_dataset
+            return LengthGroupedSampler(batch_size=settings["microbatch_size"] * accumulation,
+                                        lengths=[len(row["input_ids"]) for row in rows])
+
+    trainer = MaskedTrainer(model=model, args=training_args, train_dataset=Dataset.from_list(train_rows),
+                         eval_dataset=Dataset.from_list(val_rows),
                       data_collator=Collator(tokenizer.pad_token_id), processing_class=tokenizer,
                       callbacks=[IdentityCallback(), timing])
     tracked = [(name, p) for name, p in model.named_parameters() if p.requires_grad and "lora_B" in name]
@@ -199,7 +207,10 @@ def train(args, config):
         seconds = sum(timing.samples) / len(timing.samples)
         total_steps = math.ceil(len(train_records) / effective) * settings["epochs"]
         write_json(out / "benchmark.json", {"steady_optimizer_step_seconds": seconds, "estimated_training_hours": seconds * total_steps / 3600,
-                                           "note": "Estimate excludes validation, downloads and checkpoint overhead; exclusions can change total steps."})
+                                           "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(),
+                                           "training_tokens_per_optimizer_step": sum(len(r["input_ids"]) for r in train_rows) / len(train_rows) * effective,
+                                           "training_tokens_per_second": sum(len(r["input_ids"]) for r in train_rows) / len(train_rows) * effective / seconds,
+                                           "note": "Approximate non-padding input token throughput; excludes validation/downloads/checkpoints."})
     if args.smoke_test:
         if torch.equal(before, tracked[0][1].detach()):
             raise RuntimeError("Smoke test failed: LoRA weights did not update")
@@ -230,61 +241,12 @@ def train(args, config):
 
 
 def evaluate(args, config):
-    import torch
-    from transformers import Trainer, TrainingArguments
-    seed_everything(config["training"]["seed"])
-    out = fresh_directory(args.output)
-    model, tokenizer = load(config, args.checkpoint)
-    records = read_jsonl(Path(args.prepared) / "llm_validation.jsonl")
-    if args.limit:
-        records = records[:args.limit]
-    maximum = config["training"]["max_seq_length"]
-    rows, excluded = prepare(tokenizer, records, maximum)
-    trainer = Trainer(model=model, args=TrainingArguments(output_dir=str(out / "trainer"), report_to=[],
-                      per_device_eval_batch_size=1, remove_unused_columns=False), eval_dataset=rows,
-                      data_collator=Collator(tokenizer.pad_token_id))
-    metrics = trainer.evaluate()
-    model.eval()
-    model.config.use_cache = True
-    predictions = []
-    counts = {"cases": 0, "json_valid": 0, "schema_valid": 0, "tool_name_correct": 0, "arguments_exact": 0}
-    requested_cases = 0
-    for record in records:
-        requested_cases += len(record["calls"]) + 1
-        for case in generation_cases(tokenizer, record, maximum, config["training"]["generation_max_new_tokens"]):
-            ids = torch.tensor([case["input_ids"]], device=model.device)
-            with torch.no_grad():
-                output = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), do_sample=False,
-                                        max_new_tokens=config["training"]["generation_max_new_tokens"], pad_token_id=tokenizer.pad_token_id)
-            text = tokenizer.decode(output[0, ids.shape[1]:], skip_special_tokens=True)
-            try:
-                value = json.loads(text)
-                valid_json = True
-            except json.JSONDecodeError:
-                value, valid_json = None, False
-            valid_schema = valid_json and validate_action(value, case["tools"])
-            expected = case["expected"]
-            names = lambda v: [c["name"] for c in v["tool_calls"]]
-            counts["cases"] += 1
-            counts["json_valid"] += valid_json
-            counts["schema_valid"] += valid_schema
-            counts["tool_name_correct"] += bool(valid_schema and names(value) == names(expected))
-            counts["arguments_exact"] += bool(valid_schema and value == expected)
-            predictions.append({"id": case["sample_id"], "target_index": case["target_index"], "prediction": text,
-                                "expected": expected, "schema_valid": bool(valid_schema)})
-    metrics.update(counts)
-    metrics["generation_cases_excluded_overlength"] = requested_cases - counts["cases"]
-    metrics["training_examples_excluded_overlength"] = excluded
-    for key in ("json_valid", "schema_valid", "tool_name_correct", "arguments_exact"):
-        metrics[key + "_rate"] = counts[key] / counts["cases"] if counts["cases"] else None
-    metrics["evaluation_type"] = "teacher_forced_next_step; does not execute tools or measure final app state"
-    write_json(out / "metrics.json", metrics)
-    write_jsonl(out / "predictions.jsonl", predictions)
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    from .vllm import evaluate as evaluate_vllm
+    return evaluate_vllm(args, config)
 
 
 def export(args, config):
-    from peft import PeftModel
+    import unsloth  # Import before PEFT/Transformers patches.
     out = fresh_directory(args.output)
     if args.merge:
         model, tokenizer = load(config, args.checkpoint, merge_export=True)
@@ -308,24 +270,8 @@ def export(args, config):
 
 
 def predict(args, config):
-    import torch
-    if not args.input:
-        raise ValueError("predict requires --input JSON with messages or a prepared-format record")
-    value = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    messages = value.get("messages")
-    if messages is None:
-        messages, targets = trajectory(value)
-        messages = messages[:targets[0]]
-    model, tokenizer = load(config, args.checkpoint)
-    ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-    if len(ids) + config["training"]["generation_max_new_tokens"] > config["training"]["max_seq_length"]:
-        raise ValueError("Input plus generation budget exceeds context; nothing was truncated")
-    tensor = torch.tensor([ids], device=model.device)
-    model.eval()
-    with torch.no_grad():
-        output = model.generate(input_ids=tensor, attention_mask=torch.ones_like(tensor), do_sample=False,
-                                max_new_tokens=config["training"]["generation_max_new_tokens"], pad_token_id=tokenizer.pad_token_id)
-    print(tokenizer.decode(output[0, len(ids):], skip_special_tokens=True))
+    from .vllm import predict as predict_vllm
+    return predict_vllm(args, config)
 
 
 def run(args, config):

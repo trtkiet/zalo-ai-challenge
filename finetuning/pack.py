@@ -12,7 +12,7 @@ def main():
     args = parser.parse_args()
     destination = Path(args.output).expanduser().resolve()
     allowed_directories = {"configs", "requirements", "ftkit", "tests"}
-    allowed_root = {"README.md", "SUBMISSION.md", "cli.py", "setup_env.py", "finetune.sh", "pack.py", ".gitignore", "VERIFICATION.md"}
+    allowed_root = {"README.md", "SUBMISSION.md", "MIGRATION.md", "cli.py", "setup_env.py", "gpu_validate.py", "finetune.sh", "pack.py", ".gitignore", "VERIFICATION.md"}
     with zipfile.ZipFile(destination, "x", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(ROOT.rglob("*")):
             relative = path.relative_to(ROOT)

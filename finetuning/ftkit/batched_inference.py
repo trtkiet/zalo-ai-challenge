@@ -21,45 +21,6 @@ def seconds_left(deadline):
     return seconds
 
 
-def generate_batch(model, tokenizer, config, requests, seconds):
-    import torch
-
-    deadline = time.monotonic() + seconds
-    maximum = min(16384, int(config["training"]["max_seq_length"]))
-    budget = int(config["training"].get("generation_max_new_tokens", 512))
-    responses = [None] * len(requests)
-    indices, rows = [], []
-    for index, request in enumerate(requests):
-        try:
-            ids = tokenizer.apply_chat_template(request["messages"], tokenize=True, add_generation_prompt=True)
-            if not ids:
-                raise ValueError("Empty tokenized prompt")
-            if len(ids) + budget > maximum:
-                raise ValueError(f"Context overflow: {len(ids)} input + {budget} output tokens > {maximum}; no truncation")
-            indices.append(index)
-            rows.append(ids)
-        except Exception as exc:
-            responses[index] = error_result(exc)
-    if rows:
-        try:
-            padded, mask = left_pad(rows, tokenizer.pad_token_id)
-            tensor = torch.tensor(padded, device=model.device)
-            attention_mask = torch.tensor(mask, device=model.device)
-            generated = model.generate(input_ids=tensor, attention_mask=attention_mask, do_sample=False,
-                                       num_beams=1, max_new_tokens=budget, max_time=seconds_left(deadline),
-                                       pad_token_id=tokenizer.pad_token_id)
-            texts = tokenizer.batch_decode(generated[:, len(padded[0]):], skip_special_tokens=True)
-            if len(texts) != len(rows):
-                raise ValueError("LLM returned mismatched batch size")
-            for index, ids, text in zip(indices, rows, texts):
-                responses[index] = {"ok": True, "text": text, "input_tokens": len(ids)}
-        except Exception as exc:
-            # Do not silently retry an OOM with a different batch/decoding setup.
-            for index in indices:
-                responses[index] = error_result(exc)
-    return responses
-
-
 def transcribe_batch(model, config, requests, seconds, *, loaded=None, processor=None):
     """Batch clips/chunks across samples; restore their original audio ordering.
 
@@ -72,6 +33,8 @@ def transcribe_batch(model, config, requests, seconds, *, loaded=None, processor
     clips, jobs = {}, []
     for sample, request in enumerate(requests):
         try:
+            if time.monotonic() >= request.get("deadline", float("inf")):
+                raise TimeoutError("ASR request expired before preprocessing")
             if not request["audio"]:
                 raise ValueError("No audio supplied")
             for audio_index, path in enumerate(request["audio"]):
@@ -102,6 +65,9 @@ def transcribe_batch(model, config, requests, seconds, *, loaded=None, processor
             responses[sample] = error_result(exc)
     jobs = [job for job in jobs if responses[job[0]] is None]
     for offset in range(0, len(jobs), width):
+        for sample, request in enumerate(requests):
+            if responses[sample] is None and time.monotonic() >= request.get("deadline", float("inf")):
+                responses[sample] = error_result(TimeoutError("ASR sample deadline exceeded"))
         batch = [job for job in jobs[offset:offset + width] if responses[job[0]] is None]
         if not batch:
             continue

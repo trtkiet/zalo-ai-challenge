@@ -89,6 +89,14 @@ class EnvTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser().parse_args(["submit"])
 
+    def test_explicit_empty_paths_do_not_replace_env_defaults_with_cwd(self):
+        with patch.dict(os.environ, {"DATA_ROOT": "/dataset", "RESULT": "/results"}, clear=True), patch("ftkit.env.find_env_file", return_value=None):
+            for option in ("--data-root", "--output"):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+                    parser().parse_args(["submit", option, ""])
+                self.assertIn("Omit this flag to use .ENV defaults", error.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

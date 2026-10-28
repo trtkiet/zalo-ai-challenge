@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -57,7 +58,11 @@ def audio_path(root, split, relative):
 
 def inputs(root, split):
     directory = Path(root).expanduser().resolve() / split
-    rows = read_jsonl(directory / f"{split}.jsonl")
+    source = directory / f"{split}.jsonl"
+    if not source.is_file():
+        raise FileNotFoundError(f"Dataset not found: {source}. DATA_ROOT/--data-root must point to the folder "
+                                f"containing {split}/. Check .ENV and any exported DATA_ROOT override.")
+    rows = read_jsonl(source)
     if not rows or len({r["id"] for r in rows}) != len(rows):
         raise ValueError("Empty split or duplicate input IDs")
     catalog = json.loads((directory / f"{split}_tools_catalog.json").read_text(encoding="utf-8"))
@@ -102,8 +107,6 @@ def parse_response(text):
     value = json.loads(text)
     if not isinstance(value, dict) or set(value) != {"tool_calls"} or not isinstance(value["tool_calls"], list):
         raise ValueError('Expected {"tool_calls":[...]}')
-    if len(value["tool_calls"]) > 1:
-        raise ValueError("Return at most one tool call so later actions can use actual results")
     for call in value["tool_calls"]:
         if not isinstance(call, dict) or set(call) != {"name", "arguments"} or not isinstance(call["name"], str) or not isinstance(call["arguments"], dict):
             raise ValueError("Tool calls require string name and object arguments")
@@ -122,6 +125,8 @@ class Worker:
         self.environment["PYTHONPATH"] = str(ROOT) + os.pathsep + self.environment.get("PYTHONPATH", "")
         self.environment["PYTHONUNBUFFERED"] = "1"
         self.environment["USE_TF"] = "0"
+        self.environment["VLLM_NO_USAGE_STATS"] = "1"
+        self.environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         if not allow_download:
             self.environment["HF_HUB_OFFLINE"] = "1"
             self.environment["TRANSFORMERS_OFFLINE"] = "1"
@@ -136,7 +141,8 @@ class Worker:
         self.messages = queue.Queue()
         self.log = self.log_path.open("a", encoding="utf-8")
         self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
-                                        text=True, encoding="utf-8", bufsize=1, env=self.environment)
+                                        text=True, encoding="utf-8", bufsize=1, env=self.environment,
+                                        start_new_session=os.name != "nt")
         process, messages = self.process, self.messages
 
         def reader():
@@ -198,7 +204,12 @@ class Worker:
     def close(self):
         if self.process is not None:
             process, self.process = self.process, None
-            if process.poll() is None:
+            if os.name != "nt":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            elif process.poll() is None:
                 process.kill()
             try:
                 process.wait(timeout=10)
@@ -206,7 +217,10 @@ class Worker:
                 pass
             for stream in (process.stdin, process.stdout):
                 if stream:
-                    stream.close()
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
         if self.log is not None:
             self.log.close()
             self.log = None
@@ -228,8 +242,10 @@ def sample_steps(item, tools, env, root, split, *, max_seconds=30, max_tool_call
         paths = [str(audio_path(root, split, h["audio"])) for h in user_turns]
         paths.append(str(audio_path(root, split, item["audio"])))
         asr_started = time.monotonic()
-        texts = (yield ("asr", "transcribe", {"audio": paths}, deadline))["texts"]
+        asr_response = yield ("asr", "transcribe", {"audio": paths}, deadline)
+        texts = asr_response["texts"]
         trace["asr_seconds"] = time.monotonic() - asr_started
+        trace["asr_scheduler_wait_seconds"] = asr_response.get("scheduler_wait_seconds", 0)
         if len(texts) != len(paths) or not all(isinstance(t, str) and t.strip() for t in texts):
             raise ValueError("ASR returned empty or mismatched transcripts")
         for turn, text in zip(user_turns, texts):
@@ -244,16 +260,20 @@ def sample_steps(item, tools, env, root, split, *, max_seconds=30, max_tool_call
         for _ in range(max_turns):
             remaining()
             generation_started = time.monotonic()
-            response = yield ("llm", "generate", {"messages": messages}, deadline)
+            response = yield ("llm", "generate", {"messages": messages, "tools": available,
+                                                   "max_calls": max(0, max_tool_calls - len(env.get_tool_calls()))}, deadline)
             remaining()  # Never execute a response returned after this sample's deadline.
             text = response["text"]
             entry = {"response": text, "input_tokens": response.get("input_tokens"),
                      "generation_seconds": time.monotonic() - generation_started}
+            for key in ("output_tokens", "ttft_seconds", "decode_seconds", "engine_seconds", "cached_tokens",
+                        "finish_reason", "gpu_memory_used_bytes", "scheduler_wait_seconds", "worker_queue_seconds"):
+                if key in response:
+                    entry[key] = response[key]
             trace["steps"].append(entry)
             try:
                 calls = parse_response(text)
-                if calls:
-                    call = calls[0]
+                for call in calls:
                     if call["name"] not in allowed:
                         raise ValueError("Tool is not installed for this sample")
                     validation = env.validate(call["name"], call["arguments"])
@@ -274,11 +294,22 @@ def sample_steps(item, tools, env, root, split, *, max_seconds=30, max_tool_call
             if len(env.get_tool_calls()) >= max_tool_calls:
                 trace["status"] = "tool_limit"
                 break
-            remaining()
-            result = env.call(call["name"], call["arguments"])
-            entry["tool_result"] = result
-            messages.extend([{"role": "assistant", "content": action(calls)},
-                             {"role": "tool", "content": compact({"name": call["name"], "result": result})}])
+            entry["executed"] = []
+            for call in calls:
+                remaining()
+                if len(env.get_tool_calls()) >= max_tool_calls:
+                    trace["status"] = "tool_limit"
+                    break
+                result = env.call(call["name"], call["arguments"])
+                entry["executed"].append({"call": call, "result": result})
+                entry["tool_result"] = result  # Backward-compatible last-result field.
+                messages.extend([{"role": "assistant", "content": action([call])},
+                                 {"role": "tool", "content": compact({"name": call["name"], "result": result})}])
+                if result.get("ok") is False or result.get("done") is False or call["name"] == "sys.ask_missing_info":
+                    entry["discarded_calls"] = len(calls) - len(entry["executed"])
+                    break
+            if trace["status"] == "tool_limit":
+                break
         else:
             trace["status"] = "turn_limit"
         if time.monotonic() >= deadline:
@@ -311,68 +342,6 @@ def infer_sample(item, tools, env, asr, llm, root, split, **settings):
             error = None
         except (Exception, KeyboardInterrupt) as exc:
             error = exc
-
-
-def infer_batch(items, tools, package, workers, root, split, **settings):
-    """Batch independent model requests; tools always run within their own sample.
-
-    Fixed groups deliberately keep ordering/resume deterministic. Completed samples
-    leave the active batch; a fresh group starts after the current group finishes.
-    """
-    generators, pending, completed = {}, {}, {}
-
-    def advance(index, response=None, error=None):
-        try:
-            pending[index] = generators[index].throw(error) if error is not None else generators[index].send(response)
-        except StopIteration as done:
-            completed[index] = done.value
-            pending.pop(index, None)
-
-    def interrupt():
-        for index in list(pending):
-            advance(index, error=KeyboardInterrupt())
-
-    for index, item in enumerate(items):
-        started = time.monotonic()
-        env = package.ToolEnv(split, item["id"], root=root)
-        generators[index] = sample_steps(item, tools, env, root, split, started=started, **settings)
-        advance(index)
-    try:
-        while pending:
-            for index, request in list(pending.items()):
-                if time.monotonic() >= request[3]:
-                    advance(index, error=TimeoutError("Sample deadline exceeded"))
-            for kind in ("asr", "llm"):
-                indices = [i for i, request in pending.items() if request[0] == kind]
-                if not indices:
-                    continue
-                requests = [pending[i] for i in indices]
-                # Earliest deadline bounds the shared worker; queuing is timed.
-                deadline = min(request[3] for request in requests)
-                try:
-                    responses = workers[kind].request_batch(requests[0][1], [r[2] for r in requests], deadline)
-                    if len(responses) != len(indices):
-                        raise RuntimeError("Worker returned mismatched batch results")
-                except KeyboardInterrupt:
-                    interrupt()
-                    return [completed[i] for i in range(len(items))]
-                except Exception as exc:
-                    for index in indices:
-                        advance(index, error=exc)
-                    continue
-                for index, response in zip(indices, responses):
-                    if time.monotonic() >= pending[index][3] or response.get("error_type") == "TimeoutError":
-                        advance(index, error=TimeoutError(response.get("error", "Sample deadline exceeded")))
-                    elif response.get("ok"):
-                        advance(index, response=response)
-                    else:
-                        advance(index, error=RuntimeError(response.get("error", "Model request failed")))
-                    if index in completed and completed[index][1]["status"] == "interrupted":
-                        interrupt()
-                        return [completed[i] for i in range(len(items))]
-    except KeyboardInterrupt:
-        interrupt()
-    return [completed[i] for i in range(len(items))]
 
 
 def validate_records(rows, items, catalog, package):
@@ -414,7 +383,7 @@ def worker_python(args, kind, config):
     value = getattr(args, f"{kind}_python")
     if value:
         return Path(value).expanduser().resolve()
-    environment = "llm" if kind == "llm" or config["backend"] == "hf_whisper" else "asr"
+    environment = "llm-infer" if kind == "llm" or config["backend"] == "hf_whisper" else "asr"
     home = Path(os.environ.get("FINETUNE_HOME", ROOT))
     path = home / ".venvs" / environment / "bin" / "python"
     if not path.is_file():
@@ -423,6 +392,8 @@ def worker_python(args, kind, config):
 
 
 def run(args):
+    from .continuous import AsyncWorker, continuous_samples
+    from .llm_common import SCHEDULER_VERSION, llm_identity, inference_settings
     if not 0 < args.max_seconds <= 30:
         raise ValueError("--max-seconds must be > 0 and <= the competition's 30-second budget")
     if args.limit < 0 or args.max_tool_calls < 1 or args.max_turns < 1 or args.max_repairs < 0:
@@ -437,7 +408,8 @@ def run(args):
     configs = {kind: model_config(args, kind) for kind in ("asr", "llm")}
     if any(int(c.get("devices", 1)) != 1 for c in configs.values()):
         raise ValueError("Submission runs use one GPU; choose gpu16/gpu24/large, not a DDP profile")
-    maximum = configs["llm"]["training"]["max_seq_length"]
+    configs["llm"].setdefault("inference", {})["max_num_seqs"] = args.batch_size
+    maximum = inference_settings(configs["llm"])["max_seq_length"]
     if not 0 < maximum <= 16384:
         raise ValueError("LLM context must be between 1 and 16,384 tokens")
     interpreters = {kind: worker_python(args, kind, config) for kind, config in configs.items()}
@@ -457,32 +429,57 @@ def run(args):
     # Fingerprint only documented inputs/catalog and supplied runtime code, never app states.
     runtime_files = {str(p.relative_to(root / args.split)): p.read_text(encoding="utf-8")
                      for p in sorted((root / args.split / "zaic_tools").rglob("*.py"))}
-    batching = {"batch_size": args.batch_size, "scheduler": "fixed_groups_v1"} if args.batch_size > 1 else {}
+    batching = {"batch_size": args.batch_size, "scheduler": SCHEDULER_VERSION, "llm_contract": llm_identity()}
     identity = digest({"items": items, "audio_sha256": audio_hashes, "catalog": catalog, "runtime": runtime_files,
                        "configs": identity_configs, "artifacts": artifacts,
                        "settings": [args.split, args.limit, args.max_seconds, args.max_tool_calls, args.max_turns, args.max_repairs],
                        **batching})
     out = Path(args.output).expanduser().resolve()
     ledger = out / "results.jsonl"
+    journal = out / "completed.jsonl"
+    finalized = {}
+    old_traces = []
     if args.resume:
         saved = json.loads((out / "submission_run.json").read_text(encoding="utf-8"))
         if saved["identity"] != identity:
             raise ValueError("Resume identity changed: inputs, catalog, runtime, models or generation settings differ")
-        if (out / "inflight.json").exists():
-            raise ValueError("An unfinished sample marker remains. Refusing to recreate its ToolEnv or silently replay actions; inspect the interrupted run.")
-        results = read_jsonl(ledger) if ledger.exists() else []
-        validate_records(results, items[:len(results)], catalog, package)
+        records = read_jsonl(journal) if journal.exists() else []
+        for row in records:
+            sid = row["result"]["id"]
+            if sid in finalized:
+                raise ValueError("Duplicate finalized sample in completion journal")
+            finalized[sid] = row["result"]
+            old_traces.append(row["trace"])
+        expected = {item["id"]: item for item in items}
+        if finalized.keys() - expected.keys():
+            raise ValueError("Journal contains unknown sample IDs")
+        for sid, result in finalized.items():
+            validate_records([result], [expected[sid]], catalog, package)
+        marker = out / "inflight.json"
+        if marker.exists():
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            if not isinstance(marker_data.get("ids"), list):
+                raise ValueError("An unfinished sample marker remains in an incompatible format")
+            unfinished = set(marker_data["ids"]) - finalized.keys()
+            if unfinished:
+                raise ValueError("An unfinished sample marker remains. Refusing to recreate its ToolEnv or replay actions")
+            marker.unlink()  # A crash after durable completion but before marker cleanup is recoverable.
+        # Secondary readable ledgers can be reconstructed after an interrupted append.
+        from .common import write_jsonl
+        write_jsonl(ledger, finalized.values())
+        write_jsonl(out / "traces.jsonl", old_traces)
     else:
         out = fresh_directory(out)
-        results = []
         write_json(out / "submission_run.json", {"identity": identity, "split": args.split, "preview": bool(args.limit),
-                                                "configs": configs, "max_seconds": args.max_seconds, "batch_size": args.batch_size})
+                                                "configs": configs, "max_seconds": args.max_seconds,
+                                                "batch_size": args.batch_size, "scheduler": SCHEDULER_VERSION})
     workers = {}
+    previous_sigint = None
     try:
         for kind, config in configs.items():
             config_path = out / f"{kind}_config.json"
             write_json(config_path, config)
-            workers[kind] = Worker(interpreters[kind], kind, config_path, out / f"{kind}_worker.log",
+            workers[kind] = AsyncWorker(interpreters[kind], kind, config_path, out / f"{kind}_worker.log",
                                    getattr(args, f"{kind}_checkpoint"), args.icefall_dir, args.allow_download)
             print(f"Loading {kind}: {config['model']} ...", flush=True)
             workers[kind].start(time.monotonic() + args.startup_timeout)
@@ -493,36 +490,48 @@ def run(args):
         write_json(prior_models, metadata)
         if metadata["llm"]["parameters"] >= 5_000_000_000 or sum(m["parameters"] for m in metadata.values()) >= 6_000_000_000:
             raise ValueError("Selected checkpoints exceed the LLM <5B / whole-system <6B parameter limits")
-        inference_started, prior_count = time.monotonic(), len(results)
-        with ledger.open("a", encoding="utf-8") as stream, (out / "traces.jsonl").open("a", encoding="utf-8") as traces:
-            for offset in range(len(results), len(items), args.batch_size):
-                group = items[offset:offset + args.batch_size]
-                # Retain all group IDs until finalized rows are durable. A crash
-                # must never silently recreate any session in a partial group.
-                write_json(out / "inflight.json", {"ids": [item["id"] for item in group]})
-                settings = dict(max_seconds=args.max_seconds, max_tool_calls=args.max_tool_calls,
-                                max_turns=args.max_turns, max_repairs=args.max_repairs)
-                if args.batch_size == 1:
-                    item = group[0]
-                    started = time.monotonic()
-                    env = package.ToolEnv(args.split, item["id"], root=root)
-                    batch_results = [infer_sample(item, tools, env, workers["asr"], workers["llm"], root,
-                                                  args.split, started=started, **settings)]
+        inference_started, prior_count = time.monotonic(), len(finalized)
+        run_id = str(time.time_ns())
+        inflight = set()
+        stop_event = threading.Event()
+        if threading.current_thread() is threading.main_thread():
+            previous_sigint = signal.signal(signal.SIGINT, lambda *unused: stop_event.set())
+
+        def admit(sid):
+            inflight.add(sid)
+            write_json(out / "inflight.json", {"ids": sorted(inflight)})
+
+        remaining_items = [item for item in items if item["id"] not in finalized]
+        with journal.open("a", encoding="utf-8") as durable, ledger.open("a", encoding="utf-8") as stream, (out / "traces.jsonl").open("a", encoding="utf-8") as traces:
+            settings = dict(max_seconds=args.max_seconds, max_tool_calls=args.max_tool_calls,
+                            max_turns=args.max_turns, max_repairs=args.max_repairs)
+            for result, trace in continuous_samples(remaining_items, tools, package, workers, root, args.split,
+                                                     capacity=args.batch_size, on_admit=admit,
+                                                     should_stop=stop_event.is_set, **settings):
+                trace["completion_index"] = len(finalized)
+                trace["run_id"] = run_id
+                trace["admitted_at_seconds"] = trace.pop("admitted_at_monotonic") - inference_started
+                trace["completed_at_seconds"] = time.monotonic() - inference_started
+                durable.write(compact({"result": result, "trace": trace}) + "\n")
+                durable.flush()
+                os.fsync(durable.fileno())
+                stream.write(compact(result) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+                traces.write(compact(trace) + "\n")
+                traces.flush()
+                os.fsync(traces.fileno())
+                finalized[result["id"]] = result
+                inflight.discard(result["id"])
+                if inflight:
+                    write_json(out / "inflight.json", {"ids": sorted(inflight)})
                 else:
-                    batch_results = infer_batch(group, tools, package, workers, root, args.split, **settings)
-                for result, trace in batch_results:
-                    stream.write(compact(result) + "\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                    traces.write(compact(trace) + "\n")
-                    traces.flush()
-                    os.fsync(traces.fileno())
-                    results.append(result)
-                    print(f"{len(results)}/{len(items)} {result['id']}: {trace['status']}, {len(result['tool_calls'])} calls, {trace['elapsed_seconds']:.2f}s", flush=True)
-                (out / "inflight.json").unlink()
-                if any(trace["status"] == "interrupted" for _, trace in batch_results):
-                    raise KeyboardInterrupt
+                    (out / "inflight.json").unlink(missing_ok=True)
+                print(f"{len(finalized)}/{len(items)} {result['id']}: {trace['status']}, {len(result['tool_calls'])} calls, {trace['elapsed_seconds']:.2f}s", flush=True)
         inference_seconds = time.monotonic() - inference_started
+        results = [finalized[item["id"]] for item in items if item["id"] in finalized]
+        if len(results) != len(items):
+            raise KeyboardInterrupt("Active samples finalized; unadmitted samples can be resumed")
         report = validate_records(results, items, catalog, package)
         filename = "preview.jsonl" if args.limit else "submission.jsonl"
         destination = out / filename
@@ -540,11 +549,28 @@ def run(args):
         for trace in statuses:
             counts[trace["status"]] = counts.get(trace["status"], 0) + 1
         report.update({"complete_split": not bool(args.limit), "statuses": counts, "output": str(destination),
-                       "batch_size": args.batch_size, "processed_this_run": len(results) - prior_count,
+                       "scheduler": SCHEDULER_VERSION, "batch_size": args.batch_size, "processed_this_run": len(results) - prior_count,
                        "inference_seconds": inference_seconds,
                        "samples_per_second": (len(results) - prior_count) / max(inference_seconds, 1e-9)})
+        latencies = sorted(t["elapsed_seconds"] for t in statuses)
+        report["latency_seconds"] = {"p50": percentile(latencies, 0.5), "p95": percentile(latencies, 0.95)}
+        report["timeout_rate"] = counts.get("timeout", 0) / len(statuses) if statuses else 0
+        report["repairs"] = sum("validation_error" in step for t in statuses for step in t["steps"])
+        report["peak_observed_gpu_memory_bytes"] = max((step["gpu_memory_used_bytes"] for t in statuses for step in t["steps"]
+                                                       if step.get("gpu_memory_used_bytes") is not None), default=None)
         write_json(out / "summary.json", report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
     finally:
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
         for worker in workers.values():
             worker.close()
+
+
+def percentile(values, fraction):
+    if not values:
+        return None
+    position = (len(values) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    return values[lower] + (values[upper] - values[lower]) * (position - lower)

@@ -1,13 +1,42 @@
+# Migration verification (2026-10-28)
+
+- Before migration: 46 dependency-free CPU tests passed on Windows/Python 3.12.
+- Current CPU regression suite: **60 tests passed**. Covers continuous admission/refill, per-request
+  cancellation, out-of-order IPC and output restoration, durable journal resume,
+  no ToolEnv recreation, independent multi-call execution and discarded suffixes,
+  schema extension translation, loss-mask preservation, mocked Unsloth loaders,
+  and streamed vLLM adapter behavior. See the latest command result for test count.
+- The async fake-engine test requires an OS event loop. The Windows sandbox blocked
+  its local socket pair; the complete suite was therefore run outside the sandbox.
+- Python compilation, Bash syntax, and `git diff --check` passed. The portable
+  code-only ZIP was extracted into a fresh directory and its 60 tests passed;
+  data, caches, environments, and model weights are excluded.
+- `gpu_validate.py` runs real model training/resume/export/reload, both model families,
+  generation evaluation, offline previews, and optional training/inference sweeps.
+- Follow-up review covers the real worker protocol with a fake async engine,
+  cancellation acknowledgements, custom tokenizer parity, and disabled nested
+  language-model KV caches with or without training gradient checkpointing.
+- Real Unsloth/vLLM installation, CUDA performance, VRAM fit, A30/L40S repeatability,
+  quality, and network-disabled container execution are NOT verified on this host.
+- Requirements are bootstrap constraints. No Linux/GPU-certified dependency locks
+  or speedup claims were fabricated. Generate locks only after server validation.
+- The user's reported pre-migration EC2 run (4 samples / 70.825 seconds) is external
+  evidence, not a locally reproduced or controlled performance baseline.
+
+The prior verification history follows for context; it does not certify the new
+GPU backends. See MIGRATION.md for updated behavior and server commands.
+
 # Verification record
 
 Checked locally on Windows, Python 3.12, without PyTorch/CUDA training libraries.
 
-## Passed
+## Historical checks before the LLM migration
 
-- `.ENV` loading: 45 CPU tests total. Added checks for repository/toolkit file
+- `.ENV` loading: 46 CPU tests total. Added checks for repository/toolkit file
   selection, explicit file overrides, quoted paths and variable expansion,
   exported-variable and CLI precedence, literal command text, atomic failure on
-  invalid settings, CLI path defaults and required arguments without defaults.
+  invalid settings, CLI path defaults, required arguments without defaults and
+  rejection of empty CLI paths that would otherwise resolve to the working directory.
 
 - Independent-sample batching: 39 CPU tests total, including shrinking model
   batches, separate live tool histories, result ordering, repair/error isolation,

@@ -43,53 +43,37 @@ Limited runs write `preview.jsonl`, never `submission.jsonl`. Review
 `summary.json`, `traces.jsonl` and worker logs. Preview and full runs must use
 separate output directories.
 
-## Batch independent samples on one GPU
+## Continuously schedule independent samples on one GPU
 
-`--batch-size` controls how many independent samples share neural inference.
-The default is `1`, preserving individual requests. Start with `4` on a GPU
-with available memory, then compare throughput, timeout counts and peak VRAM:
+`--batch-size` is the rolling active-sample limit (default 1). A completed sample
+immediately releases its slot; another sample need not wait for the slowest member
+of a fixed group. vLLM receives LLM requests independently and continuously batches
+tokens. ASR combines requests already ready without waiting to fill a microbatch.
+One copy of each model remains resident.
 
 ```bash
 bash finetune.sh submit --data-root "$DATA_ROOT" \
-  --batch-size 4 --limit 12 --allow-download \
-  --output "$HOME/lifemate/batch4-preview"
-
-# Full submission: omit --limit and use a new directory.
-bash finetune.sh submit --data-root "$DATA_ROOT" \
-  --batch-size 4 --allow-download \
-  --output "$HOME/lifemate/batch4-public"
+  --batch-size 4 --limit 32 --allow-download \
+  --output "$HOME/lifemate/continuous4-preview"
 ```
 
-Model/config/checkpoint options work as above. Existing environments can be
-reused after copying the updated toolkit; no new dependencies are required.
+Each sample has one ToolEnv and an independent 30-second deadline including
+creation, ASR, queueing, LLM work, and tools. A timeout cancels that sample's LLM
+request; late responses cannot execute tools. An unresponsive engine is reaped
+with its process group. Increase concurrency only after checking accuracy,
+timeouts, p95 latency, throughput, and memory on the target GPU.
 
-The runner creates exactly one `ToolEnv` per sample, batches ASR clips and the
-next LLM action across samples, and executes each action only in its own
-environment. LLM prompts are left padded with attention masks; context overflow
-fails that sample without truncating its prompt. Gipformer audio clips and
-Whisper/PhoWhisper chunks are batched, retaining history/current-audio order.
-Only one copy of each model is loaded; batching does not launch model replicas.
+Durable admissions and completion journals preserve out-of-order results. Final
+output is always in input order. Resume skips completed IDs and refuses unfinished
+admissions; it never silently recreates ToolEnv. Ctrl-C stops admissions and
+finalizes active samples with their actual calls. Hard crashes fail closed.
+Old fixed-group resumes are incompatible. See [MIGRATION.md](MIGRATION.md) for
+protocol, dependency, journal, telemetry, and real GPU validation details.
 
-Batches are fixed groups: completed samples leave the active group, and the
-next group starts when the current group finishes. Each sample's 30-second
-deadline includes environment creation, ASR, waiting in its active group, LLM
-generation and tool execution. The earliest deadline bounds a shared worker
-request. Increasing batch size can improve throughput while increasing latency
-and KV-cache memory. OOMs are reported rather than silently retried with another
-batch size. Batch size `4` is a starting experiment, not a memory-fit guarantee.
-
-`summary.json` includes `batch_size`, `processed_this_run`, `inference_seconds`
-and `samples_per_second`. Inference timing excludes initial model loading and
-the up-front input fingerprinting. Compare the same sample limit/settings and
-inspect timeout/error counts alongside throughput. Traces also include ASR and
-per-action generation timings, including batch waiting time.
-
-Batch size is part of resume identity: repeat the same size with `--resume`.
-A clean Ctrl-C during inference finalizes the active group's actual calls and
-hashes before stopping. A hard crash retains an unfinished-group marker and
-resume refuses to recreate those sessions. Batched GPU execution and numerical
-repeatability still need verification on the target host; batching can change
-floating-point results even with greedy decoding.
+Inference defaults: BF16, greedy, prefix caching, chunked prefill, 4096 batched
+tokens, GPU memory utilization 0.70. Override with `--llm-set inference.*`.
+Training quantization settings do not change inference precision. New environments
+are required: `setup llm` creates both `llm-train` and `llm-infer`.
 
 ## Choose models and run the full public test
 
@@ -132,8 +116,8 @@ reset the old revision to `main` unless you specify a replacement revision.
 apply dotted JSON-style overrides, for example:
 
 ```bash
---llm-set training.max_seq_length=16384
---llm-set training.generation_max_new_tokens=384
+--llm-set inference.max_seq_length=16384
+--llm-set inference.max_new_tokens=384
 ```
 
 Context is capped at 16,384 tokens. The loaded LLM must have fewer than 5B
@@ -167,8 +151,10 @@ For each sample the runner:
 2. Transcribes historical user audio and the current request.
 3. Builds the same JSON action prompt used for fine-tuning, with installed schemas,
    user context and history. Previous history actions are not replayed.
-4. Generates one next action, validates it with `env.validate`, executes it with
-   `env.call`, and returns the **actual** tool result to the LLM.
+4. Generates constrained JSON containing independent calls, validates the entire
+   list with `env.validate`, then executes calls sequentially with `env.call`.
+   Failures, `done:false`, or clarification discard the unexecuted suffix. Only
+   actual calls/results enter the next prompt; dependent actions need another turn.
 5. Stops on an empty list. Clarification is a normal `sys.ask_missing_info` call.
    Invalid JSON/schema responses receive at most two repair opportunities before
    termination; an invalid response is not executed.
@@ -178,10 +164,10 @@ For each sample the runner:
 Defaults: **30 seconds per sample**, 12 tool calls, 20 LLM turns, two repairs.
 `--max-seconds` can lower but not exceed 30. Timing includes environment creation,
 all current/history ASR, generation and tool work. Initial model startup/kernel
-warm-up happens once before sample processing. A parent-side timeout kills an
-overdue worker; native GPU cancellation is not assumed. Simulator calls finish
-before control returns and elapsed time is reported. Worker reloads following
-timeout count toward the next affected sample's budget.
+warm-up happens once before sample processing. Ordinary LLM timeouts cancel
+individual requests. An unresponsive worker/process group is terminated; reloads
+count toward affected sample budgets. Simulator calls finish before control
+returns and elapsed time is reported.
 
 These guards do not establish compliance with the A30 runtime limit: **GPU
 inference, accuracy and end-to-end latency remain unverified locally**. Long
@@ -191,7 +177,8 @@ Files in a run directory:
 
 - `submission.jsonl`: created only after complete full-run coverage and format,
   installed-tool and official schema checks. No debug fields are included.
-- `results.jsonl`: durable finalized sample rows, used for resume.
+- `completed.jsonl`: authoritative, fsynced result/trace journal used for resume.
+- `results.jsonl`: readable sample rows in completion order, rebuilt from the journal on resume.
 - `traces.jsonl`: transcripts, model responses, actual tool results, status and
   elapsed time. Do not upload this as the submission.
 - `summary.json`: coverage/format results and status counts. A structurally valid

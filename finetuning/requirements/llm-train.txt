@@ -1,0 +1,10 @@
+# Bootstrap constraints, NOT a GPU-validated lock. setup records the resolved freeze.
+unsloth>=2025.10.12,<2027
+trl>=0.23,<1
+transformers>=4.57.1,<6
+peft>=0.17.1,<1
+datasets>=3,<5
+accelerate>=1.10.1,<2
+bitsandbytes>=0.48.1,<1
+PyYAML>=6,<7
+tensorboard>=2.20,<3

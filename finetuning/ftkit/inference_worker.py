@@ -18,6 +18,11 @@ def main():
     parser.add_argument("--checkpoint")
     parser.add_argument("--icefall-dir")
     args = parser.parse_args()
+    if args.kind == "llm":
+        from .llm_worker import serve
+        import asyncio
+        asyncio.run(serve(read_config(args.config), args.checkpoint))
+        return
     config = read_config(args.config)
     protocol = sys.stdout
 
@@ -31,19 +36,7 @@ def main():
             seed_everything(config.get("training", {}).get("seed", 42))
             gpu_precision(config)
             backend = config["backend"]
-            if args.kind == "llm":
-                from .backends.llm import load
-                model, tokenizer = load(config, args.checkpoint)
-                model.eval()
-                model.config.use_cache = True
-                parameter_count = model.get_nb_trainable_parameters()[1] if hasattr(model, "get_nb_trainable_parameters") else model.num_parameters()
-                # Warm kernels once, outside sample timing.
-                token = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
-                warm = torch.tensor([[token]], device=model.device)
-                with torch.inference_mode():
-                    model.generate(input_ids=warm, attention_mask=torch.ones_like(warm), max_new_tokens=1,
-                                   do_sample=False, pad_token_id=tokenizer.pad_token_id)
-            elif backend == "zipformer_rnnt":
+            if backend == "zipformer_rnnt":
                 from .backends.asr import load, features
                 namespace = types.SimpleNamespace(icefall_dir=args.icefall_dir)
                 loaded = load(namespace, config, args.checkpoint)
@@ -78,35 +71,25 @@ def main():
         return
 
     for line in sys.stdin:
+        request = {}
         try:
             request = json.loads(line)
+            if request.get("operation") == "cancel":
+                continue  # Read-only ASR may finish; parent ignores a cancelled request.
             if request.get("operation") == "shutdown":
                 return
             with redirect_stdout(sys.stderr), torch.inference_mode():
                 seconds = max(0.001, float(request["seconds"]))
                 started = time.monotonic()
                 if request.get("operation", "").endswith("_batch"):
-                    from .batched_inference import generate_batch, transcribe_batch
+                    from .batched_inference import transcribe_batch
                     requests = request["requests"]
                     if not isinstance(requests, list) or not requests:
                         raise ValueError("A model batch requires a nonempty request list")
-                    if args.kind == "llm":
-                        results = generate_batch(model, tokenizer, config, requests, seconds)
-                    else:
-                        results = transcribe_batch(model, config, requests, seconds,
-                                                   loaded=loaded if backend == "zipformer_rnnt" else None,
-                                                   processor=processor if backend == "hf_whisper" else None)
+                    results = transcribe_batch(model, config, requests, seconds,
+                                               loaded=loaded if backend == "zipformer_rnnt" else None,
+                                               processor=processor if backend == "hf_whisper" else None)
                     value = {"results": results}
-                elif args.kind == "llm":
-                    ids = tokenizer.apply_chat_template(request["messages"], tokenize=True, add_generation_prompt=True)
-                    maximum = min(16384, int(config["training"]["max_seq_length"]))
-                    budget = int(config["training"].get("generation_max_new_tokens", 512))
-                    if len(ids) + budget > maximum:
-                        raise ValueError(f"Context overflow: {len(ids)} input + {budget} output tokens > {maximum}; no truncation")
-                    tensor = torch.tensor([ids], device=model.device)
-                    result = model.generate(input_ids=tensor, attention_mask=torch.ones_like(tensor), do_sample=False,
-                                            max_new_tokens=budget, max_time=seconds, pad_token_id=tokenizer.pad_token_id)
-                    value = {"text": tokenizer.decode(result[0, len(ids):], skip_special_tokens=True), "input_tokens": len(ids)}
                 else:
                     texts = []
                     for path in request["audio"]:
@@ -140,9 +123,9 @@ def main():
                             texts.append(" ".join(parts).strip())
                     value = {"texts": texts}
                 torch.cuda.synchronize()
-            send({"ok": True, **value})
+            send({"request_id": request.get("request_id"), "ok": True, **value})
         except Exception as exc:
-            send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            send({"request_id": request.get("request_id"), "ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__})
 
 
 if __name__ == "__main__":

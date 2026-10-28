@@ -11,9 +11,9 @@ from unittest.mock import patch
 from cli import parser
 from ftkit.common import read_jsonl, write_json
 from ftkit.data import action, validate_action
-from ftkit.submission import (Worker, audio_path, infer_batch, infer_sample, parse_response, run,
+from ftkit.submission import (Worker, audio_path, infer_sample, parse_response, run,
                               validate_records, worker_python)
-from ftkit.batched_inference import generate_batch, left_pad, transcribe_batch
+from ftkit.batched_inference import left_pad, transcribe_batch
 
 
 TOOLS = {
@@ -64,6 +64,34 @@ class FakeLLM:
         return {"text": response}
 
 
+class FakeAsyncTransport:
+    def __init__(self, worker):
+        self.worker = worker
+        self.ready = worker.ready
+        self.responses = []
+        self.sequence = 0
+    def start(self, deadline):
+        return self.worker.start(deadline)
+    def submit(self, operation, payload, deadline):
+        self.sequence += 1
+        rid = str(self.sequence)
+        if operation == "transcribe_batch":
+            values = self.worker.request_batch("transcribe", payload["requests"], deadline) if hasattr(self.worker, "request_batch") else [self.worker.request("transcribe", p, deadline) for p in payload["requests"]]
+            result = {"ok": True, "results": [{"ok": True, **v} for v in values]}
+        else:
+            result = self.worker.request_batch(operation, [payload], deadline)[0] if hasattr(self.worker, "request_batch") else self.worker.request(operation, payload, deadline)
+            result = {"ok": True, **result}
+        self.responses.append({"request_id": rid, **result})
+        return rid
+    def poll(self):
+        values, self.responses = self.responses, []
+        return values
+    def cancel(self, rid):
+        self.responses = [v for v in self.responses if v["request_id"] != rid]
+    def close(self):
+        self.worker.close()
+
+
 class BatchTests(unittest.TestCase):
     def workers(self, scripts):
         class ASR:
@@ -97,90 +125,10 @@ class BatchTests(unittest.TestCase):
                 return FakeEnv()
         return Package
 
-    def test_independent_trajectories_shrink_batches_and_keep_order(self):
-        first = {"name": "contacts.search", "arguments": {"query": "mẹ"}}
-        second = {"name": "sms.send", "arguments": {"contact_id": "LIVE_ID", "content": "hello"}}
-        workers = self.workers({"synthetic_1": [action([first]), action([second]), action([])],
-                                "synthetic_2": [action([])]})
-        package = self.package()
-        rows = infer_batch([item("synthetic_1"), item("synthetic_2")], TOOLS, package, workers, Path.cwd(), "public_test")
-        self.assertEqual(package.initialized, ["synthetic_1", "synthetic_2"])
-        self.assertEqual(workers["asr"].sizes, [2])
-        self.assertEqual(workers["llm"].sizes, [2, 1, 1])
-        self.assertEqual([row[0]["id"] for row in rows], package.initialized)
-        self.assertEqual(rows[0][0]["tool_calls"], [first, second])
-        self.assertEqual(rows[1][0]["tool_calls"], [])
-        self.assertEqual([row[1]["status"] for row in rows], ["stopped", "stopped"])
-        self.assertIn("LIVE_ID", json.dumps(workers["llm"].prompts[2]))
-        self.assertNotIn("LIVE_ID", json.dumps(workers["llm"].prompts[1]))
-
-    def test_batch_repairs_and_model_errors_are_isolated(self):
-        workers = self.workers({"synthetic_1": ["invalid", action([])],
-                                "synthetic_2": [{"ok": False, "error": "context overflow"}]})
-        rows = infer_batch([item("synthetic_1"), item("synthetic_2")], TOOLS, self.package(), workers, Path.cwd(), "public_test")
-        self.assertEqual(rows[0][1]["status"], "stopped")
-        self.assertEqual(rows[1][1]["status"], "error")
-        self.assertIn("context overflow", rows[1][1]["error"])
-        self.assertTrue(all(not row[0]["tool_calls"] for row in rows))
-
-    def test_timeout_or_interrupt_preserves_each_samples_executed_calls(self):
-        call = {"name": "contacts.search", "arguments": {"query": "mẹ"}}
-        for exception, status in [(TimeoutError("deadline"), "timeout"), (KeyboardInterrupt(), "interrupted")]:
-            workers = self.workers({"synthetic_1": [action([call])], "synthetic_2": [action([call])]})
-            original = workers["llm"].request_batch
-            def request(operation, payloads, deadline):
-                if workers["llm"].sizes:
-                    raise exception
-                return original(operation, payloads, deadline)
-            workers["llm"].request_batch = request
-            rows = infer_batch([item("synthetic_1"), item("synthetic_2")], TOOLS, self.package(), workers, Path.cwd(), "public_test")
-            self.assertEqual([row[1]["status"] for row in rows], [status, status])
-            self.assertEqual([row[0]["tool_calls"] for row in rows], [[call], [call]])
-
-    def test_late_model_response_never_executes_tools(self):
-        workers = self.workers({"synthetic_1": []})
-        def request(operation, payloads, deadline):
-            time.sleep(0.03)
-            return [{"ok": True, "text": action([{"name": "contacts.search", "arguments": {"query": "mẹ"}}])}]
-        workers["llm"].request_batch = request
-        rows = infer_batch([item()], TOOLS, self.package(), workers, Path.cwd(), "public_test", max_seconds=0.02)
-        self.assertEqual(rows[0][1]["status"], "timeout")
-        self.assertEqual(rows[0][0]["tool_calls"], [])
-
     def test_left_padding_preserves_prompts_and_masks(self):
         ids, masks = left_pad([[8, 9], [1, 2, 3, 4]], 0)
         self.assertEqual(ids, [[0, 0, 8, 9], [1, 2, 3, 4]])
         self.assertEqual(masks, [[0, 0, 1, 1], [1, 1, 1, 1]])
-
-    def test_batched_llm_padding_output_slicing_and_overflow_isolation(self):
-        # Exercise the generation wrapper without importing GPU libraries.
-        import types
-        class Tensor:
-            def __init__(self, rows):
-                self.rows = rows
-            def __getitem__(self, key):
-                return [row[key[1]] for row in self.rows[key[0]]]
-        class Model:
-            device = "test"
-            def generate(self, **kwargs):
-                self.kwargs = kwargs
-                return Tensor([row + [99 + i] for i, row in enumerate(kwargs["input_ids"].rows)])
-        class Tokenizer:
-            pad_token_id = 0
-            def apply_chat_template(self, messages, **kwargs):
-                return messages
-            def batch_decode(self, rows, **kwargs):
-                return [str(row[0]) for row in rows]
-        model = Model()
-        config = {"training": {"max_seq_length": 6, "generation_max_new_tokens": 2}}
-        with patch.dict(sys.modules, {"torch": types.SimpleNamespace(tensor=lambda rows, **kwargs: Tensor(rows))}):
-            results = generate_batch(model, Tokenizer(), config,
-                                     [{"messages": [1]}, {"messages": [2, 3, 4]}, {"messages": list(range(6))}], 5)
-        self.assertEqual([r.get("text") for r in results], ["99", "100", None])
-        self.assertIn("Context overflow", results[2]["error"])
-        self.assertEqual(model.kwargs["input_ids"].rows, [[0, 0, 1], [2, 3, 4]])
-        self.assertEqual(model.kwargs["attention_mask"].rows, [[0, 0, 1], [1, 1, 1]])
-        self.assertEqual([r.get("input_tokens") for r in results], [1, 3, None])
 
     def test_gipformer_batches_clips_and_restores_sample_history_order(self):
         import wave
@@ -365,7 +313,7 @@ class OrchestratorTests(unittest.TestCase):
                         else {"ok": True, "text": action([])} for payload in payloads]
             def close(self):
                 pass
-        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.submission.Worker", ModelWorker):
+        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.continuous.AsyncWorker", lambda *a, **kw: FakeAsyncTransport(ModelWorker(*a, **kw))):
             root = Path(td)
             args = self.fixture(root, count=5)
             args.batch_size = 2
@@ -373,7 +321,8 @@ class OrchestratorTests(unittest.TestCase):
             rows = read_jsonl(root / "run/submission.jsonl")
             self.assertEqual([row["id"] for row in rows], initialized)
             self.assertEqual(len(initialized), 5)
-            self.assertEqual(batch_sizes, [(kind, size) for size in (2, 2, 1) for kind in ("asr", "llm")])
+            self.assertEqual(sum(size for kind, size in batch_sizes if kind == "asr"), 5)
+            self.assertEqual(sum(size for kind, size in batch_sizes if kind == "llm"), 5)
             self.assertFalse((root / "run/inflight.json").exists())
             args.resume = True
             run(args)
@@ -407,7 +356,7 @@ class OrchestratorTests(unittest.TestCase):
                         else {"ok": True, "text": action([])} for payload in payloads]
             def close(self):
                 pass
-        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.submission.Worker", ModelWorker):
+        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.continuous.AsyncWorker", lambda *a, **kw: FakeAsyncTransport(ModelWorker(*a, **kw))):
             root = Path(td)
             args = self.fixture(root, count=3)
             args.batch_size = 2
@@ -453,7 +402,7 @@ class OrchestratorTests(unittest.TestCase):
                 return {"texts": ["history", "current"]} if self.kind == "asr" else {"text": action([])}
             def close(self):
                 pass
-        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.submission.Worker", ModelWorker):
+        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.continuous.AsyncWorker", lambda *a, **kw: FakeAsyncTransport(ModelWorker(*a, **kw))):
             root = Path(td)
             args = self.fixture(root)
             run(args)
@@ -496,7 +445,7 @@ class OrchestratorTests(unittest.TestCase):
                 return {"texts": ["history", "current"]} if self.kind == "asr" else {"text": action([])}
             def close(self):
                 pass
-        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.submission.Worker", ModelWorker):
+        with tempfile.TemporaryDirectory() as td, patch("ftkit.submission.runtime", return_value=Package), patch("ftkit.continuous.AsyncWorker", lambda *a, **kw: FakeAsyncTransport(ModelWorker(*a, **kw))):
             root = Path(td)
             args = self.fixture(root)
             args.limit = 1
