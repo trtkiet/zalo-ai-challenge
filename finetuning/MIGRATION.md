@@ -7,12 +7,12 @@ new `llm-infer` environment for its Transformers dependencies.
 
 ## Install on the Linux GPU server
 
-Use Python 3.11 for both LLM environments. ASR retains its existing Torch/k2
+Use Python 3.11 or 3.12 for both LLM environments. ASR retains its existing Torch/k2
 pins and CUDA 12.8 driver requirement. Each LLM framework resolves its own Torch
 dependencies; its CUDA wheel must support the installed NVIDIA driver.
 
 ```bash
-export PYTHON=python3.11
+export PYTHON=python3.12  # python3.11 is also supported
 bash finetune.sh setup llm
 # Or: bash finetune.sh setup llm-train / setup llm-infer
 ```
@@ -21,13 +21,17 @@ This creates `.venvs/llm-train` and `.venvs/llm-infer` under `FINETUNE_HOME`.
 The old `.venvs/llm` is neither used nor deleted. Setup refuses to overwrite an
 incomplete or incompatible environment; use a fresh `FINETUNE_HOME` to rebuild.
 Compatible new environments can be reused. Install ASR separately if necessary.
+Setup checks the Python minor version before reusing an environment. Selecting
+3.12 does not convert an existing 3.11 venv; use a fresh `FINETUNE_HOME` to rebuild.
 
 `requirements/llm-train.txt` and `llm-infer.txt` are **bootstrap constraints**,
 not validated locks. Setup records a resolved freeze and checks imports, CUDA,
 BF16 support, and `pip check`. No real model compatibility or speed is established
 by installation alone. After successful server checks, `gpu_validate.py
---write-locks` creates separate lock files for review and committing. They are
-used by subsequent clean setups. No untested lock is presented as verified.
+--write-locks` creates separate lock files for review and committing, for example
+`llm-train.py311.lock.txt` and `llm-train.py312.lock.txt` (and corresponding
+`llm-infer` files). Setup selects only a lock matching its Python version.
+Legacy unversioned LLM locks apply to 3.11 only. No untested lock is presented as verified.
 
 ## Training and exports
 
@@ -141,10 +145,10 @@ Prime the selected ASR and LLM caches with an `--allow-download` preview first.
 Then run, separately on the L40S and A30:
 
 ```bash
-python3.11 gpu_validate.py --prepared "$PREPARED" --data-root "$DATA_ROOT" \
+"${PYTHON:-python3.12}" gpu_validate.py --prepared "$PREPARED" --data-root "$DATA_ROOT" \
   --output "$HOME/migration-validation"
 # Longer experiment; new directory required:
-python3.11 gpu_validate.py --prepared "$PREPARED" --data-root "$DATA_ROOT" \
+"${PYTHON:-python3.12}" gpu_validate.py --prepared "$PREPARED" --data-root "$DATA_ROOT" \
   --output "$HOME/migration-sweep" --sweep --write-locks
 ```
 

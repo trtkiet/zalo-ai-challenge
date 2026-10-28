@@ -9,6 +9,7 @@ import time
 
 from ftkit.common import fresh_directory, read_jsonl, write_json
 from ftkit.env import load_env_file
+from setup_env import llm_lock_path
 
 ROOT = Path(__file__).resolve().parent
 
@@ -104,17 +105,20 @@ def main():
                 py = home / ".venvs" / runtime / "bin/python"
                 subprocess.run([str(py), "-m", "pip", "check"], check=True)
                 freeze = subprocess.check_output([str(py), "-m", "pip", "freeze"], text=True)
-                target = ROOT / "requirements" / f"{runtime}.lock.txt"
+                version = json.loads(subprocess.check_output(
+                    [str(py), "-c", "import json,sys; print(json.dumps(list(sys.version_info[:2])))"], text=True))
+                target = llm_lock_path(ROOT, runtime, version)
                 if target.exists():
                     raise ValueError(f"Refusing to overwrite existing lock {target}")
                 cuda = subprocess.check_output([str(py), "-c", "import torch; print(torch.version.cuda)"], text=True).strip()
                 index = f"--extra-index-url https://download.pytorch.org/whl/cu{cuda.replace('.', '')}\n" if cuda != "None" else ""
-                target.write_text(f"# Validated by {out / 'report.json'} on {report['hardware']}\n" + index + freeze)
+                target.write_text(f"# Python {version[0]}.{version[1]}; validated by {out / 'report.json'} on {report['hardware']}\n" + index + freeze)
                 import hashlib
                 marker = home / ".venvs" / runtime / "setup.json"
                 state = json.loads(marker.read_text())
                 state.update(requirements_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
-                             source=target.name, gpu_model_smoke_verified=True, evidence=str(out / "report.json"))
+                             source=target.name, python_version=version,
+                             gpu_model_smoke_verified=True, evidence=str(out / "report.json"))
                 write_json(marker, state)
         report["status"] = "passed_on_this_gpu"
     except Exception as exc:

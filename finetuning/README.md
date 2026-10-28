@@ -1,7 +1,7 @@
 # LifeMate portable fine-tuning
 
 Copy **this entire folder** to a Linux x86_64 NVIDIA GPU machine. It is independent
-of the original checkout. Use Python 3.11 for the isolated LLM runtimes; ASR supports Python 3.10–3.12.
+of the original checkout. Use Python 3.11 or 3.12 for the isolated LLM runtimes; ASR supports Python 3.10–3.12.
 ASR training requires a driver supporting **CUDA 12.8 or newer**, as required by the
 pinned Gipformer/k2 wheels. Each LLM runtime resolves its own CUDA dependencies. Setup does
 not change your notebook's global Python packages or install a driver.
@@ -272,7 +272,7 @@ architecture configuration. Their decoding requires the pinned icefall checkout.
 ## Kaggle / Colab cells
 
 Upload the folder and competition data privately or mount them. Replace these
-example paths with your actual input locations. Python 3.11 for LLMs and a compatible
+example paths with your actual input locations. Python 3.11/3.12 for LLMs and a compatible
 GPU driver are still required; setup stops clearly on an incompatible runtime.
 
 ```python

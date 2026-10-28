@@ -2,6 +2,7 @@
 import copy
 import importlib.metadata
 import json
+import sys
 from pathlib import Path
 
 from .common import digest
@@ -19,6 +20,7 @@ def llm_identity(tokenizer=None):
         except importlib.metadata.PackageNotFoundError:
             pass
     return {"protocol": PROTOCOL_VERSION, "prompt_sha256": digest(SYSTEM), "packages": versions,
+            "python_version": list(sys.version_info[:3]),
             "implementation_sha256": digest({str(p.relative_to(Path(__file__).parent)): p.read_text(encoding="utf-8")
                                                for p in sorted(Path(__file__).parent.rglob("*.py"))}),
             "template_sha256": digest(tokenizer.chat_template) if tokenizer is not None else None,

@@ -1,7 +1,7 @@
 # Migration verification (2026-10-28)
 
 - Before migration: 46 dependency-free CPU tests passed on Windows/Python 3.12.
-- Current CPU regression suite: **60 tests passed**. Covers continuous admission/refill, per-request
+- Current CPU regression suite: **66 tests passed** on Python 3.12.11. Covers continuous admission/refill, per-request
   cancellation, out-of-order IPC and output restoration, durable journal resume,
   no ToolEnv recreation, independent multi-call execution and discarded suffixes,
   schema extension translation, loss-mask preservation, mocked Unsloth loaders,
@@ -9,13 +9,16 @@
 - The async fake-engine test requires an OS event loop. The Windows sandbox blocked
   its local socket pair; the complete suite was therefore run outside the sandbox.
 - Python compilation, Bash syntax, and `git diff --check` passed. The portable
-  code-only ZIP was extracted into a fresh directory and its 60 tests passed;
+  code-only ZIP was extracted into a fresh directory and its 66 tests passed;
   data, caches, environments, and model weights are excluded.
 - `gpu_validate.py` runs real model training/resume/export/reload, both model families,
   generation evaluation, offline previews, and optional training/inference sweeps.
 - Follow-up review covers the real worker protocol with a fake async engine,
   cancellation acknowledgements, custom tokenizer parity, and disabled nested
   language-model KV caches with or without training gradient checkpointing.
+- Python 3.11 and 3.12 LLM setup paths are covered by mocked installation tests,
+  including minor-version reuse guards and version-specific dependency locks.
+  Real GPU installation on either Python version remains server-only validation.
 - Real Unsloth/vLLM installation, CUDA performance, VRAM fit, A30/L40S repeatability,
   quality, and network-disabled container execution are NOT verified on this host.
 - Requirements are bootstrap constraints. No Linux/GPU-certified dependency locks

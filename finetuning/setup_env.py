@@ -14,6 +14,23 @@ import hashlib
 from ftkit.env import load_env_file
 
 ROOT = Path(__file__).resolve().parent
+LLM_PYTHON_VERSIONS = {(3, 11), (3, 12)}
+
+
+def llm_lock_path(root, environment, version):
+    """Resolved freezes are specific to a Python minor version and CUDA runtime."""
+    if tuple(version) not in LLM_PYTHON_VERSIONS:
+        raise ValueError("LLM setup requires Python 3.11 or 3.12; select it with PYTHON=/path/to/python3.12")
+    return Path(root) / "requirements" / f"{environment}.py{version[0]}{version[1]}.lock.txt"
+
+
+def recorded_python_version(state):
+    version = state.get("python_version")
+    if isinstance(version, list) and len(version) == 2:
+        return tuple(version)
+    # Earlier setup markers recorded sys.version only (the original runtime was 3.11).
+    match = re.match(r"(\d+)\.(\d+)", state.get("python", ""))
+    return tuple(map(int, match.groups())) if match else None
 
 
 def run(*args):
@@ -23,16 +40,22 @@ def run(*args):
 
 def setup_llm_environment(environment, home):
     """Let each framework resolve its own Torch/CUDA dependencies in a fresh venv."""
-    if sys.version_info[:2] != (3, 11):
-        raise ValueError("LLM setup requires Python 3.11; select it with PYTHON=/path/to/python3.11")
+    version = tuple(sys.version_info[:2])
     destination = home / ".venvs" / environment
     requirement = ROOT / "requirements" / f"{environment}.txt"
-    lock = ROOT / "requirements" / f"{environment}.lock.txt"
+    lock = llm_lock_path(ROOT, environment, version)
+    legacy_lock = ROOT / "requirements" / f"{environment}.lock.txt"
+    if not lock.is_file() and version == (3, 11) and legacy_lock.is_file():
+        lock = legacy_lock
     source = lock if lock.is_file() else requirement
     signature = hashlib.sha256(source.read_bytes()).hexdigest()
     marker = destination / "setup.json"
     if destination.exists():
-        if marker.is_file() and json.loads(marker.read_text())["requirements_sha256"] == signature:
+        state = json.loads(marker.read_text()) if marker.is_file() else {}
+        recorded = recorded_python_version(state)
+        if recorded != version:
+            raise ValueError(f"Refusing to reuse {destination}: Python {recorded} differs from requested {version}; use a new FINETUNE_HOME")
+        if state.get("requirements_sha256") == signature:
             print(f"Reusing {destination}; run GPU validation separately.")
             return
         raise ValueError(f"Refusing to overwrite incomplete/incompatible environment {destination}; use a new FINETUNE_HOME")
@@ -47,7 +70,8 @@ def setup_llm_environment(environment, home):
     freeze = subprocess.check_output([str(py), "-m", "pip", "freeze"], text=True)
     (destination / "installed-packages.txt").write_text(freeze)
     marker.write_text(json.dumps({"requirements_sha256": signature, "source": source.name,
-                                  "gpu_model_smoke_verified": False, "python": sys.version}, indent=2))
+                                  "gpu_model_smoke_verified": False, "python": sys.version,
+                                  "python_version": list(version)}, indent=2))
     print(f"Ready: {py}. Resolved packages are recorded; full model/GPU verification is still required.")
 
 
